@@ -54,12 +54,12 @@ def fetch_active_profiles(selected_ids=None) -> list:
         return []
 
 def update_last_run(profile_id: str):
-    """Updates the last_run_at timestamp for a profile."""
+    """Updates the last_run timestamp for a profile."""
     supabase = get_supabase_client()
     from datetime import datetime
     try:
         supabase.table("bot_profiles").update(
-            {"last_run_at": datetime.utcnow().isoformat()}
+            {"last_run": datetime.utcnow().isoformat()}
         ).eq("id", profile_id).execute()
     except Exception as e:
-        log.warning(f"⚠️ Could not update last_run_at for {profile_id}: {e}")
+        log.warning(f"⚠️ Could not update last_run for {profile_id}: {e}")

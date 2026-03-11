@@ -1,12 +1,14 @@
 """
 profiles_config.py
 ------------------
-Fetches active profiles dynamically from Supabase.
+Fetches active profiles dynamically from Supabase and pushes live 
+telemetry (status, tasks, errors) back to the Command Center.
 Ready to scale to 10,000+ profiles.
 """
 import os
 import logging
 from pathlib import Path
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -43,9 +45,11 @@ def fetch_active_profiles(selected_ids=None) -> list:
         profiles = response.data
         
         # Ensure the 'profile_id' key maps correctly for legacy code compatibility
+        # We copy it rather than 'pop' to prevent KeyErrors in main.py
         for p in profiles:
-            p["profile_id"] = p.pop("mlx_profile_id")
-            
+            if "mlx_profile_id" in p:
+                p["profile_id"] = p.get("mlx_profile_id")
+                
         log.info(f"✅ Loaded {len(profiles)} active profiles from database.")
         return profiles
         
@@ -53,13 +57,36 @@ def fetch_active_profiles(selected_ids=None) -> list:
         log.error(f"❌ Failed to fetch profiles from Supabase: {e}")
         return []
 
+def update_profile_status(profile_id: str, status: str, tasks: list = None, error_msg: str = None):
+    """
+    Pushes live telemetry to Supabase.
+    Statuses: 'IDLE', 'RUNNING', 'SUCCESS', 'FAILED'
+    """
+    supabase = get_supabase_client()
+    payload = {"status": status}
+    
+    if tasks is not None:
+        payload["last_tasks"] = tasks
+        
+    # If error_msg is provided, update it. If status is SUCCESS, clear the error log.
+    if error_msg:
+        payload["error_log"] = error_msg
+    elif status == "SUCCESS":
+        payload["error_log"] = None
+
+    try:
+        supabase.table("bot_profiles").update(payload).eq("id", profile_id).execute()
+    except Exception as e:
+        log.warning(f"⚠️ Could not update Supabase status for {profile_id}: {e}")
+
 def update_last_run(profile_id: str):
     """Updates the last_run timestamp for a profile."""
     supabase = get_supabase_client()
-    from datetime import datetime
     try:
+        # Using timezone-aware UTC datetime is safer for Postgres
+        now_iso = datetime.now(timezone.utc).isoformat()
         supabase.table("bot_profiles").update(
-            {"last_run": datetime.utcnow().isoformat()}
+            {"last_run": now_iso}
         ).eq("id", profile_id).execute()
     except Exception as e:
         log.warning(f"⚠️ Could not update last_run for {profile_id}: {e}")

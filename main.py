@@ -1,25 +1,12 @@
 """
 main.py
 -------
-Complete orchestrator for scalable daily browser warming.
-Runs Google Search warming, YouTube warming, Third-Party Web Wandering, and Newsletter Signups.
+Nexus Enterprise Farm Orchestrator.
+Complete production-ready brain for browser warming.
 
-[UPGRADED ENTERPRISE FEATURES]
-  1. Supabase Integration: Fetches active profiles dynamically from the cloud database.
-  2. OpenAI Integration: Dynamically generates mathematically unique Google Search queries.
-  3. Entropy Router: Randomly shuffles the order of Google, YouTube, and Wander tasks per bot.
-  4. Passive Inbox Warming: 20% chance per run to sign up for a newsletter to fill the Gmail inbox.
-  5. Circadian Rhythm: The built-in scheduler (--schedule) drifts randomly by ±1.5 hours.
-  6. PARALLEL EXECUTION: Uses an asyncio.Semaphore to run multiple profiles concurrently.
-
-Usage:
-  python main.py -c 5                 # Run 5 profiles concurrently (RECOMMENDED DEFAULT)
-  python main.py --google-only        # Google Search only
-  python main.py --youtube-only       # YouTube only
-  python main.py --wander-only        # Third-Party Web Wander only (Data Saver)
-  python main.py --day 15             # Specify warming day
-  python main.py --schedule -c 5      # Run daily on a schedule with 5 concurrent browsers
-  python main.py --profile sarah_nyc  # Run one specific profile ID
+[11 PILLARS OF BEHAVIOR]
+1. Google Search  2. YouTube  3. Web Wander  4. Newsletters  5. Maps
+6. Workspace  7. Calendar  8. News  9. Gmail  10. Shopping  11. Drive
 """
 
 import asyncio
@@ -34,10 +21,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
-# Custom Modules
+# Custom Modules - Ensure all these .py files exist in your folder!
 from auth import get_token
 from mlx_api import start_profile, stop_profile
-from profiles_config import fetch_active_profiles, update_last_run
+from profiles_config import fetch_active_profiles, update_last_run, update_profile_status
 from behavior_engine import (
     human_type,
     human_scroll,
@@ -51,11 +38,19 @@ from youtube_warm import youtube_warm_session
 from llm_helper import generate_dynamic_search
 from wander_the_web import wander_session
 from newsletter_sub import subscribe_to_newsletter
+from maps_warm import maps_warm_session
+from workspace_warm import workspace_warm_session
+from calendar_warm import calendar_warm_session
+from news_warm import news_warm_session
+from gmail_warm import gmail_warm_session
+from shopping_warm import shopping_warm_session
+from oauth_warm import oauth_warm_session
+from drive_warm import drive_warm_session
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 # ---------------------------------------------------------------------------
-# LOGGING
+# LOGGING & PERSONA ICONS
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -65,9 +60,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 PERSONA_ICONS = {
-    "sarah_nyc":     "👩‍💼", "marcus_austin": "🧑‍💻", "linda_chicago": "👩‍🍳",
-    "james_london":  "🧑‍💼", "priya_la":      "👩‍🎨", "tom_houston":   "🧑‍🔧",
-    "yuki_seattle":  "👩‍🔬",
+    "sarah_nyc": "👩‍💼", "marcus_austin": "🧑‍💻", "linda_chicago": "👩‍🍳",
+    "james_london": "🧑‍💼", "priya_la": "👩‍🎨", "tom_houston": "🧑‍🔧",
+    "yuki_seattle": "👩‍🔬",
 }
 
 def plog(profile_id: str, msg: str):
@@ -75,7 +70,7 @@ def plog(profile_id: str, msg: str):
     log.info(f"{icon} [{profile_id[:15]:15s}] {msg}")
 
 # ---------------------------------------------------------------------------
-# STEALTH PATCHES
+# STEALTH PATCHES (EVADE TRACKING)
 # ---------------------------------------------------------------------------
 STEALTH_SCRIPT = """
 () => {
@@ -145,19 +140,16 @@ async def google_session(page, profile: dict):
         await target.scroll_into_view_if_needed(timeout=5000)
         await page.evaluate("window.scrollBy(0, -150)") 
         await asyncio.sleep(lognormal_delay(300, 800))
-    except Exception:
-        pass
+    except Exception: pass
         
     try:
         await click_humanly(page, target, behavior)
-    except Exception as e:
-        plog(pid, "⚠️ Standard click failed, using forced JS click.")
+    except Exception:
         await target.evaluate("el => el.click()")
 
     await smart_wait(page)
     await asyncio.sleep(lognormal_delay(800, 2500))
 
-    plog(pid, "Reading article...")
     scroll_sessions = random.randint(*behavior["scroll_sessions"])
     for s in range(scroll_sessions):
         try:
@@ -175,26 +167,38 @@ async def google_session(page, profile: dict):
 # ---------------------------------------------------------------------------
 async def warm_profile(profile: dict, token: str, run_google: bool = True, run_youtube: bool = True, run_wander: bool = True, warm_day: int = 15):
     pid = profile["id"]
-    profile_id = profile["mlx_profile_id"]
+    profile_id = profile.get("profile_id")
     behavior = profile["behavior"]
     browser_cfg = profile["browser"]
 
     plog(pid, f"Starting warm session (Day {warm_day})")
+    
+    # 📡 TRACKING: Mark as running in Supabase Command Center
+    update_profile_status(pid, status="RUNNING", tasks=[])
+    completed_tasks = []
+
+    if not profile_id:
+        err_msg = "Missing profile_id in profile data."
+        plog(pid, f"❌ {err_msg}")
+        update_profile_status(pid, status="FAILED", error_msg=err_msg)
+        return
 
     try:
         loop = asyncio.get_running_loop()
         ws_url = await loop.run_in_executor(None, start_profile, profile_id, token)
     except Exception as e:
-        plog(pid, f"❌ Could not start profile: {e}")
+        plog(pid, f"❌ MLX Launch Fail: {e}")
+        update_profile_status(pid, status="FAILED", error_msg=f"Multilogin Error: {str(e)}")
         return
 
     async with async_playwright() as p:
         try:
             browser = await p.chromium.connect_over_cdp(ws_url)
         except Exception as e:
-            plog(pid, f"❌ Playwright could not connect: {e}")
+            plog(pid, f"❌ Playwright CDP Fail: {e}")
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, stop_profile, profile_id, token)
+            update_profile_status(pid, status="FAILED", error_msg=f"Browser Connect Error: {str(e)}")
             return
 
         context = browser.contexts[0] if browser.contexts else await browser.new_context(
@@ -208,77 +212,81 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         await page.set_viewport_size({"width": vp["width"] + random.randint(-4, 4), "height": vp["height"] + random.randint(-4, 4)})
 
         try:
+            # 🎲 THE ENTROPY MATRIX (TASK SELECTION)
             sessions = []
             if run_google: sessions.append("google")
             if run_youtube: sessions.append("youtube")
             if run_wander: sessions.append("wander")
 
-            # [NEW] 20% chance to drop the bot's email into a newsletter to trigger passive inbound mail
-            if random.random() < 0.20:
-                sessions.append("newsletter")
+            # Probability Signals
+            if random.random() < 0.20: sessions.append("newsletter")
+            if random.random() < 0.30: sessions.append("maps")
+            if random.random() < 0.15: sessions.append("workspace")
+            if random.random() < 0.10: sessions.append("calendar")
+            if random.random() < 0.25: sessions.append("news")
+            if random.random() < 0.30: sessions.append("gmail") 
+            if random.random() < 0.25: sessions.append("shopping")
+            if random.random() < 0.10: sessions.append("oauth")
+            if random.random() < 0.10: sessions.append("drive")    # FIXED: Added Drive to probability list
 
-            # Shuffle the order! Breaks predictable fingerprinting patterns perfectly.
             random.shuffle(sessions)
 
             for session_type in sessions:
-                if session_type == "google":
-                    await google_session(page, profile)
+                plog(pid, f"⚡ Active Task: {session_type.upper()}")
                 
-                elif session_type == "youtube":
-                    plog(pid, f"📺 Starting YouTube session...")
-                    await youtube_warm_session(page, profile, behavior, warm_day=warm_day)
-                    plog(pid, "✅ YouTube session complete")
-                
-                elif session_type == "wander":
-                    await wander_session(page, profile) 
+                if session_type == "google": await google_session(page, profile)
+                elif session_type == "youtube": await youtube_warm_session(page, profile, behavior, warm_day=warm_day)
+                elif session_type == "wander": await wander_session(page, profile) 
+                elif session_type == "newsletter": await subscribe_to_newsletter(page, profile)
+                elif session_type == "maps": await maps_warm_session(page, profile)
+                elif session_type == "workspace": await workspace_warm_session(page, profile)
+                elif session_type == "calendar": await calendar_warm_session(page, profile)
+                elif session_type == "news": await news_warm_session(page, profile)
+                elif session_type == "gmail": await gmail_warm_session(page, profile)
+                elif session_type == "shopping": await shopping_warm_session(page, profile)
+                elif session_type == "oauth": await oauth_warm_session(page, profile)
+                elif session_type == "drive": await drive_warm_session(page, profile) # FIXED: Added Drive execution
 
-                elif session_type == "newsletter":
-                    plog(pid, f"📥 Starting Newsletter Subscription session...")
-                    await subscribe_to_newsletter(page, profile)
-                    plog(pid, "✅ Newsletter session complete")
+                # 📡 TRACKING
+                completed_tasks.append(session_type)
+                update_profile_status(pid, status="RUNNING", tasks=completed_tasks)
 
-                # If there are more tasks left, take a human-like pause before the next one
                 if len(sessions) > 1 and session_type != sessions[-1]:
                     pause = random.uniform(15, 45)
-                    plog(pid, f"⏸ Switching tasks in {pause:.0f}s...")
+                    plog(pid, f"⏸ Task Transition: {pause:.0f}s")
                     await asyncio.sleep(pause)
 
-            plog(pid, "✅ Full warm session complete.")
+            plog(pid, "✅ All tasks completed successfully.")
+            update_profile_status(pid, status="SUCCESS", tasks=completed_tasks)
 
         except Exception as e:
-            plog(pid, f"⚠️ Session error: {e}")
+            plog(pid, f"⚠️ Session Error: {e}")
+            update_profile_status(pid, status="FAILED", tasks=completed_tasks, error_msg=str(e))
 
         finally:
             try: await browser.close()
             except Exception: pass
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, stop_profile, profile_id, token)
-            plog(pid, "💾 Profile stopped and cookies saved.")
+            plog(pid, "💾 Profile saved and exited.")
 
 # ---------------------------------------------------------------------------
 # ORCHESTRATOR
 # ---------------------------------------------------------------------------
-async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=3):
+async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=10):
     log.info("🔑 Authenticating with Multilogin...")
     try:
         token = get_token()
     except Exception as e:
-        log.error(f"❌ Authentication failed: {e}")
+        log.error(f"❌ Auth Failed: {e}")
         return
 
     profiles_to_run = fetch_active_profiles(selected_ids)
     if not profiles_to_run:
-        log.error("No matching profiles found in database.")
+        log.error("No active profiles found in database.")
         return
 
-    mode = []
-    if run_google: mode.append("Google")
-    if run_youtube: mode.append("YouTube")
-    if run_wander: mode.append("Wander")
-    
-    log.info(f"🚀 Launching {len(profiles_to_run)} profile(s) | Mode: {' + '.join(mode)} | Day {warm_day}")
-    log.info(f"🚦 CONCURRENCY LEVEL: {max_concurrent} browsers at a time")
-
+    log.info(f"🚀 SWARM START: {len(profiles_to_run)} bots | Concurrency: {max_concurrent}")
     sem = asyncio.Semaphore(max_concurrent)
 
     async def process_profile(profile):
@@ -290,40 +298,29 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
 
     tasks = [process_profile(profile) for profile in profiles_to_run]
     await asyncio.gather(*tasks)
-
-    log.info("🏁 All profiles complete.\n")
-
+    log.info("🏁 Full Farm Cycle Complete.")
 
 # ---------------------------------------------------------------------------
 # DAILY SCHEDULER
 # ---------------------------------------------------------------------------
-def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=3):
+def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=10):
     run_time = os.getenv("SCHEDULE_TIME", "09:00").strip()
-    log.info(f"📅 Scheduler active — base target time is {run_time} daily.")
-    log.info("   Press Ctrl+C to stop.\n")
-
+    log.info(f"📅 Scheduler active — Daily target: {run_time}")
+    
     current_day = warm_day
     while True:
         now = datetime.now()
         h, m = map(int, run_time.split(":"))
         target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        
-        if target <= now:
-            target += timedelta(days=1)
+        if target <= now: target += timedelta(days=1)
             
-        jitter_minutes = random.uniform(-90, 90)
-        actual_target = target + timedelta(minutes=jitter_minutes)
-        
-        if actual_target <= now:
-            actual_target = now + timedelta(minutes=5)
-            
+        jitter = random.uniform(-90, 90)
+        actual_target = target + timedelta(minutes=jitter)
         wait = (actual_target - now).total_seconds()
 
-        log.info(f"⏰ Next run randomly shifted to {actual_target.strftime('%Y-%m-%d %H:%M:%S')} "
-                 f"(in {wait/3600:.1f}h) | Warming day {current_day}")
+        log.info(f"⏰ Next run: {actual_target.strftime('%H:%M:%S')} (in {wait/3600:.1f}h)")
+        time.sleep(max(wait, 0))
         
-        time.sleep(wait)
-        log.info(f"▶ Daily warm starting — Day {current_day}")
         asyncio.run(run_all(selected_ids, run_google, run_youtube, run_wander, current_day, max_concurrent=concurrency))
         current_day += 1
 
@@ -331,40 +328,26 @@ def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wand
 # ENTRY POINT
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Scalable Multilogin daily warmer")
+    parser = argparse.ArgumentParser(description="Nexus Enterprise Farm Orchestrator")
     parser.add_argument("--profile", "-p", nargs="+", default=None)
     parser.add_argument("--schedule", "-s", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    
-    # Modes
     parser.add_argument("--google-only", action="store_true")
     parser.add_argument("--youtube-only", action="store_true")
     parser.add_argument("--wander-only", action="store_true")
-    
     parser.add_argument("--day", type=int, default=15)
-    parser.add_argument("--concurrency", "-c", type=int, default=3, help="Number of browsers to run at the same time (default: 3)")
+    parser.add_argument("--concurrency", "-c", type=int, default=10)
     
     args = parser.parse_args()
 
-    run_google = True
-    run_youtube = True
-    run_wander = True
-
-    if args.google_only:
-        run_youtube = False
-        run_wander = False
-    elif args.youtube_only:
-        run_google = False
-        run_wander = False
-    elif args.wander_only:
-        run_google = False
-        run_youtube = False
+    g, y, w = True, True, True
+    if args.google_only: y, w = False, False
+    elif args.youtube_only: g, w = False, False
+    elif args.wander_only: g, y = False, False
 
     if args.dry_run:
-        db_profiles = fetch_active_profiles(args.profile)
-        if db_profiles:
-            log.info(f"Total profiles fetched: {len(db_profiles)}")
+        log.info(f"Dry-run: {len(fetch_active_profiles(args.profile))} profiles detected.")
     elif args.schedule:
-        run_scheduler(args.profile, run_google, run_youtube, run_wander, args.day, args.concurrency)
+        run_scheduler(args.profile, g, y, w, args.day, args.concurrency)
     else:
-        asyncio.run(run_all(args.profile, run_google, run_youtube, run_wander, args.day, max_concurrent=args.concurrency))
+        asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency))

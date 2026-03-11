@@ -3,6 +3,7 @@ profiles_config.py
 ------------------
 Fetches active profiles dynamically from Supabase and pushes live 
 telemetry (status, tasks, errors) back to the Command Center.
+Includes Regional Timezone filtering for manual circadian pacing.
 Ready to scale to 10,000+ profiles.
 """
 import os
@@ -22,10 +23,11 @@ def get_supabase_client() -> Client:
         raise ValueError("Missing SUPABASE_URL or SUPABASE_KEY in .env")
     return create_client(url, key)
 
-def fetch_active_profiles(selected_ids=None) -> list:
+def fetch_active_profiles(selected_ids=None, region=None) -> list:
     """
     Fetches profiles from the database. 
     If selected_ids is provided, it only fetches those specific profiles.
+    If region is provided, it filters the results by the browser's timezone string.
     Otherwise, it fetches all profiles where is_active = True.
     """
     supabase = get_supabase_client()
@@ -45,12 +47,27 @@ def fetch_active_profiles(selected_ids=None) -> list:
         profiles = response.data
         
         # Ensure the 'profile_id' key maps correctly for legacy code compatibility
-        # We copy it rather than 'pop' to prevent KeyErrors in main.py
         for p in profiles:
             if "mlx_profile_id" in p:
                 p["profile_id"] = p.get("mlx_profile_id")
                 
-        log.info(f"✅ Loaded {len(profiles)} active profiles from database.")
+        # --- NEW: REGIONAL TIMEZONE FILTERING ---
+        if region:
+            region_target = region.lower()
+            filtered_profiles = []
+            for p in profiles:
+                # Safely grab the timezone string (e.g., "Australia/Sydney")
+                tz = p.get("browser", {}).get("timezone", "").lower()
+                
+                # If the target region (e.g., "australia") is in the timezone string, keep it
+                if region_target in tz:
+                    filtered_profiles.append(p)
+            
+            profiles = filtered_profiles
+            log.info(f"🌍 Applied region filter '{region.upper()}'. {len(profiles)} profiles matched.")
+        else:
+            log.info(f"✅ Loaded {len(profiles)} active profiles from database (Global).")
+            
         return profiles
         
     except Exception as e:

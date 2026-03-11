@@ -21,7 +21,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
-# Custom Modules - Ensure all these .py files exist in your folder!
+# Custom Modules
 from auth import get_token
 from mlx_api import start_profile, stop_profile
 from profiles_config import fetch_active_profiles, update_last_run, update_profile_status
@@ -227,7 +227,7 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
             if random.random() < 0.30: sessions.append("gmail") 
             if random.random() < 0.25: sessions.append("shopping")
             if random.random() < 0.10: sessions.append("oauth")
-            if random.random() < 0.10: sessions.append("drive")    # FIXED: Added Drive to probability list
+            if random.random() < 0.10: sessions.append("drive")
 
             random.shuffle(sessions)
 
@@ -245,14 +245,15 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
                 elif session_type == "gmail": await gmail_warm_session(page, profile)
                 elif session_type == "shopping": await shopping_warm_session(page, profile)
                 elif session_type == "oauth": await oauth_warm_session(page, profile)
-                elif session_type == "drive": await drive_warm_session(page, profile) # FIXED: Added Drive execution
+                elif session_type == "drive": await drive_warm_session(page, profile)
 
-                # 📡 TRACKING
+                # 📡 TRACKING: PUSH PROGRESS TO SUPABASE
                 completed_tasks.append(session_type)
                 update_profile_status(pid, status="RUNNING", tasks=completed_tasks)
 
                 if len(sessions) > 1 and session_type != sessions[-1]:
-                    pause = random.uniform(15, 45)
+                    # 🚀 MODERATE PAUSE: 10-25 seconds (optimized for 8-hour max swarm time)
+                    pause = random.uniform(10, 25)
                     plog(pid, f"⏸ Task Transition: {pause:.0f}s")
                     await asyncio.sleep(pause)
 
@@ -273,7 +274,7 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
 # ---------------------------------------------------------------------------
 # ORCHESTRATOR
 # ---------------------------------------------------------------------------
-async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=10):
+async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=15, region=None):
     log.info("🔑 Authenticating with Multilogin...")
     try:
         token = get_token()
@@ -281,17 +282,20 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
         log.error(f"❌ Auth Failed: {e}")
         return
 
-    profiles_to_run = fetch_active_profiles(selected_ids)
+    # Passing the REGION filter into the Supabase fetcher
+    profiles_to_run = fetch_active_profiles(selected_ids, region=region)
+    
     if not profiles_to_run:
-        log.error("No active profiles found in database.")
+        log.error(f"No active profiles found in database for region: {region or 'ALL'}.")
         return
 
-    log.info(f"🚀 SWARM START: {len(profiles_to_run)} bots | Concurrency: {max_concurrent}")
+    log.info(f"🚀 SWARM START: {len(profiles_to_run)} bots | Region: {region or 'GLOBAL'} | Concurrency: {max_concurrent}")
     sem = asyncio.Semaphore(max_concurrent)
 
     async def process_profile(profile):
         async with sem:
-            await asyncio.sleep(random.uniform(0.5, 4.0))
+            # 🚦 SAFE STAGGER: 1.0 to 10.0 seconds to protect local MLX API during launch
+            await asyncio.sleep(random.uniform(1.0, 10.0))
             await warm_profile(profile, token, run_google, run_youtube, run_wander, warm_day)
             update_last_run(profile["id"])
             await asyncio.sleep(random.uniform(2, 5))
@@ -303,9 +307,9 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
 # ---------------------------------------------------------------------------
 # DAILY SCHEDULER
 # ---------------------------------------------------------------------------
-def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=10):
+def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=15, region=None):
     run_time = os.getenv("SCHEDULE_TIME", "09:00").strip()
-    log.info(f"📅 Scheduler active — Daily target: {run_time}")
+    log.info(f"📅 Scheduler active — Daily target: {run_time} | Region: {region or 'GLOBAL'}")
     
     current_day = warm_day
     while True:
@@ -321,7 +325,7 @@ def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wand
         log.info(f"⏰ Next run: {actual_target.strftime('%H:%M:%S')} (in {wait/3600:.1f}h)")
         time.sleep(max(wait, 0))
         
-        asyncio.run(run_all(selected_ids, run_google, run_youtube, run_wander, current_day, max_concurrent=concurrency))
+        asyncio.run(run_all(selected_ids, run_google, run_youtube, run_wander, current_day, max_concurrent=concurrency, region=region))
         current_day += 1
 
 # ---------------------------------------------------------------------------
@@ -336,7 +340,12 @@ if __name__ == "__main__":
     parser.add_argument("--youtube-only", action="store_true")
     parser.add_argument("--wander-only", action="store_true")
     parser.add_argument("--day", type=int, default=15)
-    parser.add_argument("--concurrency", "-c", type=int, default=10)
+    
+    # Defaults to 15 for optimal hardware utilization
+    parser.add_argument("--concurrency", "-c", type=int, default=15)
+    
+    # NEW: Filter bots by geographical timezone
+    parser.add_argument("--region", "-r", type=str, default=None, help="Filter bots by timezone (e.g., 'australia', 'america', 'europe')")
     
     args = parser.parse_args()
 
@@ -346,8 +355,11 @@ if __name__ == "__main__":
     elif args.wander_only: g, y = False, False
 
     if args.dry_run:
-        log.info(f"Dry-run: {len(fetch_active_profiles(args.profile))} profiles detected.")
+        # Pass region into the dry run test
+        bots = fetch_active_profiles(args.profile, region=args.region)
+        log.info(f"Dry-run: {len(bots)} profiles detected for region '{args.region or 'ALL'}'.")
     elif args.schedule:
-        run_scheduler(args.profile, g, y, w, args.day, args.concurrency)
+        run_scheduler(args.profile, g, y, w, args.day, args.concurrency, args.region)
     else:
-        asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency))
+        # Pass region into the main orchestrator execution
+        asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency, region=args.region))

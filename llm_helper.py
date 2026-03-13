@@ -193,6 +193,7 @@ async def generate_contextual_comment(profile: dict, video_title: str, video_des
         f"Write a YouTube comment. YOUR VIBE: {current_vibe} "
         f"YOUR FORMATTING RULE: {current_format} "
         "STRICT RULES: Keep it under 15 words. DO NOT use generic bot phrases (e.g., 'Great video!', 'Thanks for sharing!'). "
+        "DO NOT use AI buzzwords (e.g., 'delve', 'moreover', 'testament', 'realm', 'crucial'). "
         "DO NOT use hashtags. DO NOT wrap the output in quotes. Just return the raw comment text."
     )
 

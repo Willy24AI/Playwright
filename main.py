@@ -2,11 +2,11 @@
 main.py
 -------
 Nexus Enterprise Farm Orchestrator.
-Complete production-ready brain for browser warming.
+Complete production-ready brain for browser warming and targeted strikes.
 
-[11 PILLARS OF BEHAVIOR]
-1. Google Search  2. YouTube  3. Web Wander  4. Newsletters  5. Maps
-6. Workspace  7. Calendar  8. News  9. Gmail  10. Shopping  11. Drive
+[12 PILLARS OF BEHAVIOR]
+1. Google Search  2. YouTube Warm  3. YouTube Strike  4. Web Wander  5. Newsletters
+6. Maps  7. Workspace  8. Calendar  9. News  10. Gmail  11. Shopping  12. Drive
 """
 
 import asyncio
@@ -35,6 +35,7 @@ from behavior_engine import (
     move_mouse_humanly,
 )
 from youtube_warm import youtube_warm_session
+from youtube_strike import execute_target_strike  # <-- IMPORTED STRIKE MODULE
 from llm_helper import generate_dynamic_search
 from wander_the_web import wander_session
 from newsletter_sub import subscribe_to_newsletter
@@ -165,7 +166,7 @@ async def google_session(page, profile: dict):
 # ---------------------------------------------------------------------------
 # CORE PROFILE SESSION (THE ROUTER)
 # ---------------------------------------------------------------------------
-async def warm_profile(profile: dict, token: str, run_google: bool = True, run_youtube: bool = True, run_wander: bool = True, warm_day: int = 15):
+async def warm_profile(profile: dict, token: str, run_google: bool = True, run_youtube: bool = True, run_wander: bool = True, warm_day: int = 15, strike_keyword: str = None, strike_channel: str = None):
     pid = profile["id"]
     profile_id = profile.get("profile_id")
     behavior = profile["behavior"]
@@ -214,8 +215,18 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         try:
             # 🎲 THE ENTROPY MATRIX (TASK SELECTION)
             sessions = []
+            
+            # --- STRIKE INJECTION ---
+            if strike_keyword and strike_channel:
+                sessions.append("youtube_strike")
+                plog(pid, f"🎯 Strike Mission Queued: {strike_keyword} -> {strike_channel}")
+            
             if run_google: sessions.append("google")
-            if run_youtube: sessions.append("youtube")
+            
+            # Only add standard YouTube warm if we aren't doing a Strike, to prevent conflicting behaviors
+            if run_youtube and "youtube_strike" not in sessions: 
+                sessions.append("youtube")
+                
             if run_wander: sessions.append("wander")
 
             # Probability Signals
@@ -229,6 +240,7 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
             if random.random() < 0.10: sessions.append("oauth")
             if random.random() < 0.10: sessions.append("drive")
 
+            # Shuffle to ensure randomized human behavior ordering
             random.shuffle(sessions)
 
             for session_type in sessions:
@@ -236,6 +248,7 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
                 
                 if session_type == "google": await google_session(page, profile)
                 elif session_type == "youtube": await youtube_warm_session(page, profile, behavior, warm_day=warm_day)
+                elif session_type == "youtube_strike": await execute_target_strike(page, profile, strike_keyword, strike_channel)
                 elif session_type == "wander": await wander_session(page, profile) 
                 elif session_type == "newsletter": await subscribe_to_newsletter(page, profile)
                 elif session_type == "maps": await maps_warm_session(page, profile)
@@ -274,7 +287,7 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
 # ---------------------------------------------------------------------------
 # ORCHESTRATOR
 # ---------------------------------------------------------------------------
-async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=15, region=None):
+async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=15, region=None, strike_keyword=None, strike_channel=None):
     log.info("🔑 Authenticating with Multilogin...")
     try:
         token = get_token()
@@ -296,7 +309,7 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
         async with sem:
             # 🚦 SAFE STAGGER: 1.0 to 10.0 seconds to protect local MLX API during launch
             await asyncio.sleep(random.uniform(1.0, 10.0))
-            await warm_profile(profile, token, run_google, run_youtube, run_wander, warm_day)
+            await warm_profile(profile, token, run_google, run_youtube, run_wander, warm_day, strike_keyword, strike_channel)
             update_last_run(profile["id"])
             await asyncio.sleep(random.uniform(2, 5))
 
@@ -307,7 +320,7 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
 # ---------------------------------------------------------------------------
 # DAILY SCHEDULER
 # ---------------------------------------------------------------------------
-def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=15, region=None):
+def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=15, region=None, strike_keyword=None, strike_channel=None):
     run_time = os.getenv("SCHEDULE_TIME", "09:00").strip()
     log.info(f"📅 Scheduler active — Daily target: {run_time} | Region: {region or 'GLOBAL'}")
     
@@ -325,7 +338,7 @@ def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wand
         log.info(f"⏰ Next run: {actual_target.strftime('%H:%M:%S')} (in {wait/3600:.1f}h)")
         time.sleep(max(wait, 0))
         
-        asyncio.run(run_all(selected_ids, run_google, run_youtube, run_wander, current_day, max_concurrent=concurrency, region=region))
+        asyncio.run(run_all(selected_ids, run_google, run_youtube, run_wander, current_day, max_concurrent=concurrency, region=region, strike_keyword=strike_keyword, strike_channel=strike_channel))
         current_day += 1
 
 # ---------------------------------------------------------------------------
@@ -344,9 +357,13 @@ if __name__ == "__main__":
     # Defaults to 15 for optimal hardware utilization
     parser.add_argument("--concurrency", "-c", type=int, default=15)
     
-    # NEW: Filter bots by geographical timezone
+    # Filter bots by geographical timezone
     parser.add_argument("--region", "-r", type=str, default=None, help="Filter bots by timezone (e.g., 'australia', 'america', 'europe')")
     
+    # NEW: Targeted YouTube Strike Arguments
+    parser.add_argument("--strike-keyword", type=str, default=None, help="Target search phrase for YouTube Strike")
+    parser.add_argument("--strike-channel", type=str, default=None, help="Exact channel name for YouTube Strike verification")
+
     args = parser.parse_args()
 
     g, y, w = True, True, True
@@ -354,12 +371,19 @@ if __name__ == "__main__":
     elif args.youtube_only: g, w = False, False
     elif args.wander_only: g, y = False, False
 
+    # Validate Strike Args (Requires both)
+    if (args.strike_keyword and not args.strike_channel) or (args.strike_channel and not args.strike_keyword):
+        log.error("❌ Strike Mission Error: You must provide BOTH --strike-keyword and --strike-channel.")
+        exit(1)
+
     if args.dry_run:
         # Pass region into the dry run test
         bots = fetch_active_profiles(args.profile, region=args.region)
         log.info(f"Dry-run: {len(bots)} profiles detected for region '{args.region or 'ALL'}'.")
+        if args.strike_keyword:
+            log.info(f"Dry-run Strike Active: Targeting '{args.strike_keyword}' on channel '{args.strike_channel}'")
     elif args.schedule:
-        run_scheduler(args.profile, g, y, w, args.day, args.concurrency, args.region)
+        run_scheduler(args.profile, g, y, w, args.day, args.concurrency, args.region, args.strike_keyword, args.strike_channel)
     else:
-        # Pass region into the main orchestrator execution
-        asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency, region=args.region))
+        # Pass region and strike parameters into the main orchestrator execution
+        asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency, region=args.region, strike_keyword=args.strike_keyword, strike_channel=args.strike_channel))

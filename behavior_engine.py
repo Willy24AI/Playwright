@@ -2,14 +2,17 @@
 behavior_engine.py
 ------------------
 Master suite of human-simulation primitives. 
-Uses log-normal distributions and physics-based movement to bypass 
-advanced behavioral telemetry.
+Uses log-normal distributions, Fitts's Law, and physics-based movement 
+to bypass advanced behavioral telemetry.
 """
 
 import asyncio
 import math
 import random
 import time
+
+# Global state tracker to prevent cursor teleportation between function calls
+CURSOR_STATE = {"x": 0, "y": 0, "initialized": False}
 
 # ---------------------------------------------------------------------------
 # TIMING & PHYSICS UTILITIES
@@ -38,27 +41,57 @@ def wpm_to_keystroke_ms(wpm: int) -> tuple[float, float]:
 
 async def move_mouse_humanly(page, target_x: float, target_y: float, speed_factor: float = 1.0):
     """
-    Simulates natural hand movement using a Cubic Bezier curve.
-    Features: Ease-in/Ease-out, micro-tremors, and randomized overshooting.
+    Simulates natural hand movement using Fitts's Law and proportional Bezier curves.
+    Features: State tracking, Ease-out deceleration, and micro-tremors.
     """
-    # Rest position (start from a plausible area since Playwright doesn't track current mouse)
-    start_x = random.randint(100, 600)
-    start_y = random.randint(100, 600)
+    global CURSOR_STATE
+    
+    # 1. Statefulness: Start from last known position
+    if not CURSOR_STATE["initialized"]:
+        start_x, start_y = random.randint(100, 600), random.randint(100, 600)
+        await page.mouse.move(start_x, start_y) # Instantly place it once for the session
+        CURSOR_STATE["initialized"] = True
+    else:
+        start_x, start_y = CURSOR_STATE["x"], CURSOR_STATE["y"]
 
     # 12% chance to overshoot (miss the target slightly and correct)
     if random.random() < 0.12:
-        target_x += random.randint(-20, 20)
-        target_y += random.randint(-20, 20)
+        target_x += random.randint(-15, 15)
+        target_y += random.randint(-15, 15)
 
-    # Control points for the Bezier curve (creates the 'arc' of a moving hand)
-    cp1_x, cp1_y = start_x + random.randint(-200, 200), start_y + random.randint(-200, 200)
-    cp2_x, cp2_y = target_x + random.randint(-150, 150), target_y + random.randint(-150, 150)
+    # 2. Fitts's Law: Calculate Distance
+    distance = math.hypot(target_x - start_x, target_y - start_y)
+    
+    # Ignore micro-movements to avoid division by zero or jitter loops
+    if distance < 2: 
+        await page.mouse.move(target_x, target_y)
+        CURSOR_STATE["x"], CURSOR_STATE["y"] = target_x, target_y
+        return
 
-    steps = random.randint(30, 60)
+    # Base steps on distance (~1 step per 15 pixels, clamped for safety)
+    steps = max(15, min(100, int(distance / 15))) 
+
+    # 3. Proportional Bezier Curves: Human hands naturally arc outwards.
+    angle = math.atan2(target_y - start_y, target_x - start_x)
+    
+    # The magnitude of the arc is proportional to the distance (10-20% of distance)
+    arc_magnitude = distance * random.uniform(0.1, 0.2)
+    
+    # Randomly choose if the arc goes "above" or "below" the straight line
+    direction = random.choice([-1, 1]) 
+    perp_angle = angle + (math.pi / 2 * direction)
+
+    # Control points placed at 30% and 70% of the journey, pushed outward perpendicularly
+    cp1_x = start_x + (distance * 0.3) * math.cos(angle) + arc_magnitude * math.cos(perp_angle)
+    cp1_y = start_y + (distance * 0.3) * math.sin(angle) + arc_magnitude * math.sin(perp_angle)
+    
+    cp2_x = start_x + (distance * 0.7) * math.cos(angle) + arc_magnitude * math.cos(perp_angle)
+    cp2_y = start_y + (distance * 0.7) * math.sin(angle) + arc_magnitude * math.sin(perp_angle)
+
     for i in range(steps + 1):
         t = i / steps
-        # Cubic Bezier Formula
-        t_eased = t * t * (3 - 2 * t) # Simple easing
+        # Simple ease-out (humans decelerate as they approach the target)
+        t_eased = 1 - (1 - t) * (1 - t) 
         
         x = ((1-t_eased)**3 * start_x + 3*(1-t_eased)**2 * t_eased * cp1_x + 
              3*(1-t_eased)*t_eased**2 * cp2_x + t_eased**3 * target_x)
@@ -69,9 +102,11 @@ async def move_mouse_humanly(page, target_x: float, target_y: float, speed_facto
         jitter = 1.5 if speed_factor < 0.8 else 0.9
         await page.mouse.move(x + random.uniform(-jitter, jitter), y + random.uniform(-jitter, jitter))
 
-        # Velocity: Slow at start/end, fast in the middle
-        mid_dist = abs(t - 0.5)
-        await asyncio.sleep((0.005 + (mid_dist * 0.015)) / speed_factor)
+        # Consistent polling rate pause (~120Hz monitor refresh rate equivalent)
+        await asyncio.sleep(0.008 / speed_factor)
+
+    # Update global state tracker
+    CURSOR_STATE["x"], CURSOR_STATE["y"] = target_x, target_y
 
 async def click_humanly(page, element, behavior: dict):
     """Clicks an element by moving the mouse to a random point within its bounds."""
@@ -81,7 +116,7 @@ async def click_humanly(page, element, behavior: dict):
             await element.click(force=True)
             return
 
-        # Target a random spot inside the button, not the exact center
+        # Target a random spot inside the button, not the exact geometric center
         click_x = box["x"] + box["width"] * random.uniform(0.15, 0.85)
         click_y = box["y"] + box["height"] * random.uniform(0.15, 0.85)
 
@@ -98,7 +133,7 @@ async def click_humanly(page, element, behavior: dict):
         await element.evaluate("el => el.click()")
 
 # ---------------------------------------------------------------------------
-# TYPING (WITH TYPOS & BIGRAMS)
+# TYPING (WITH DWELL TIME, TYPOS & BIGRAMS)
 # ---------------------------------------------------------------------------
 
 # Common bigrams humans type faster due to muscle memory
@@ -107,7 +142,7 @@ FAST_BIGRAMS = {"th", "he", "in", "er", "an", "re", "on", "at", "st", "en", "ed"
 async def human_type(page, selector: str, text: str, behavior: dict):
     """
     Types text with persona-specific speed, realistic typos, 
-    and muscle-memory bigram acceleration.
+    muscle-memory bigram acceleration, and simulated physical key dwell times.
     """
     element = page.locator(selector).first
     await element.focus()
@@ -119,13 +154,16 @@ async def human_type(page, selector: str, text: str, behavior: dict):
         # Typo logic: types a nearby key, pauses, backspaces, and corrects
         if random.random() < behavior.get("typo_rate", 0.03) and char.isalpha():
             typo_keys = "asdfghjklqwertyuiop"
-            await page.keyboard.type(random.choice(typo_keys))
+            # Adding dwell time to the typo keypress
+            await page.keyboard.type(random.choice(typo_keys), delay=random.uniform(70, 120))
             await asyncio.sleep(lognormal_delay(150, 400)) # Pause to 'realize' mistake
-            await page.keyboard.press("Backspace")
+            await page.keyboard.press("Backspace", delay=random.uniform(50, 100))
             await asyncio.sleep(lognormal_delay(100, 300))
 
-        await page.keyboard.type(char)
+        # Core typing execution WITH dwell time (the time the physical key is pressed down)
+        await page.keyboard.type(char, delay=random.uniform(70, 120))
 
+        # Flight time simulation (time between releasing one key and pressing the next)
         # Bigram speedup: if current + next char are common, type faster
         if i < len(text) - 1 and text[i:i+2].lower() in FAST_BIGRAMS:
             delay = lognormal_delay(min_kd * 0.4, min_kd * 0.8)

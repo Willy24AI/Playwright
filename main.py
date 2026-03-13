@@ -4,9 +4,11 @@ main.py
 Nexus Enterprise Farm Orchestrator.
 Complete production-ready brain for browser warming and targeted strikes.
 
-[12 PILLARS OF BEHAVIOR]
-1. Google Search  2. YouTube Warm  3. YouTube Strike  4. Web Wander  5. Newsletters
-6. Maps  7. Workspace  8. Calendar  9. News  10. Gmail  11. Shopping  12. Drive
+[UPGRADED]: 
+- Resilient Task Execution
+- Playwright CDP Retry Matrix
+- Database Bloat Protection (Free-Tier Safe)
+- Viral Velocity Pacing (Beta Distribution S-Curve for Strikes)
 """
 
 import asyncio
@@ -19,23 +21,20 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # Custom Modules
 from auth import get_token
 from mlx_api import start_profile, stop_profile
 from profiles_config import fetch_active_profiles, update_last_run, update_profile_status
 from behavior_engine import (
-    human_type,
-    human_scroll,
-    click_humanly,
-    idle_reading,
-    smart_wait,
-    lognormal_delay,
-    move_mouse_humanly,
+    human_type, human_scroll, click_humanly, idle_reading, 
+    smart_wait, lognormal_delay, move_mouse_humanly
 )
+
+# Pillars
 from youtube_warm import youtube_warm_session
-from youtube_strike import execute_target_strike  # <-- IMPORTED STRIKE MODULE
+from youtube_strike import execute_target_strike
 from llm_helper import generate_dynamic_search
 from wander_the_web import wander_session
 from newsletter_sub import subscribe_to_newsletter
@@ -53,11 +52,7 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 # ---------------------------------------------------------------------------
 # LOGGING & PERSONA ICONS
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
 PERSONA_ICONS = {
@@ -94,10 +89,10 @@ def pick_result(results, weights):
 
 async def handle_consent(page, pid):
     try:
-        btn = page.locator("button:has-text('Accept all'), button:has-text('Alle akzeptieren')")
+        btn = page.locator("button:has-text('Accept all' i), button:has-text('Alle akzeptieren' i)").first
         if await btn.is_visible(timeout=3000):
             plog(pid, "🍪 Accepting cookie consent...")
-            await btn.first.click()
+            await btn.click()
             await asyncio.sleep(lognormal_delay(600, 1500))
     except Exception:
         pass
@@ -107,7 +102,7 @@ async def handle_consent(page, pid):
 # ---------------------------------------------------------------------------
 async def google_session(page, profile: dict):
     pid = profile["id"]
-    behavior = profile["behavior"]
+    behavior = profile.get("behavior", {})
     topic = await generate_dynamic_search(profile, platform="Google Search")
 
     plog(pid, f"🔍 Google: '{topic}'")
@@ -121,7 +116,7 @@ async def google_session(page, profile: dict):
     await page.keyboard.press("Enter")
     await smart_wait(page)
 
-    plog(pid, "Reading search results...")
+    plog(pid, "👀 Reading search results...")
     await idle_reading(page, behavior)
 
     results = []
@@ -133,17 +128,14 @@ async def google_session(page, profile: dict):
         plog(pid, "⚠️ No results found")
         return
 
-    target = pick_result(results, behavior["result_position_weights"])
+    target = pick_result(results, behavior.get("result_position_weights", [0.4, 0.3, 0.2, 0.1]))
     if not target: return
 
-    plog(pid, f"Clicking result...")
+    plog(pid, f"🖱️ Clicking organic result...")
     try:
         await target.scroll_into_view_if_needed(timeout=5000)
         await page.evaluate("window.scrollBy(0, -150)") 
         await asyncio.sleep(lognormal_delay(300, 800))
-    except Exception: pass
-        
-    try:
         await click_humanly(page, target, behavior)
     except Exception:
         await target.evaluate("el => el.click()")
@@ -151,7 +143,7 @@ async def google_session(page, profile: dict):
     await smart_wait(page)
     await asyncio.sleep(lognormal_delay(800, 2500))
 
-    scroll_sessions = random.randint(*behavior["scroll_sessions"])
+    scroll_sessions = random.randint(*behavior.get("scroll_sessions", [3, 6]))
     for s in range(scroll_sessions):
         try:
             await human_scroll(page, behavior)
@@ -169,19 +161,17 @@ async def google_session(page, profile: dict):
 async def warm_profile(profile: dict, token: str, run_google: bool = True, run_youtube: bool = True, run_wander: bool = True, warm_day: int = 15, strike_keyword: str = None, strike_channel: str = None):
     pid = profile["id"]
     profile_id = profile.get("profile_id")
-    behavior = profile["behavior"]
-    browser_cfg = profile["browser"]
+    behavior = profile.get("behavior", {})
+    browser_cfg = profile.get("browser", {"viewport": {"width": 1920, "height": 1080}})
 
-    plog(pid, f"Starting warm session (Day {warm_day})")
+    plog(pid, f"🚀 Starting swarm sequence (Day {warm_day})")
     
-    # 📡 TRACKING: Mark as running in Supabase Command Center
     update_profile_status(pid, status="RUNNING", tasks=[])
     completed_tasks = []
 
     if not profile_id:
-        err_msg = "Missing profile_id in profile data."
-        plog(pid, f"❌ {err_msg}")
-        update_profile_status(pid, status="FAILED", error_msg=err_msg)
+        plog(pid, "❌ Missing profile_id in profile data.")
+        update_profile_status(pid, status="FAILED", error_msg="Missing MLX profile_id")
         return
 
     try:
@@ -189,66 +179,63 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         ws_url = await loop.run_in_executor(None, start_profile, profile_id, token)
     except Exception as e:
         plog(pid, f"❌ MLX Launch Fail: {e}")
-        update_profile_status(pid, status="FAILED", error_msg=f"Multilogin Error: {str(e)}")
+        update_profile_status(pid, status="FAILED", error_msg=f"MLX Error: {str(e)}")
         return
 
     async with async_playwright() as p:
-        try:
-            browser = await p.chromium.connect_over_cdp(ws_url)
-        except Exception as e:
-            plog(pid, f"❌ Playwright CDP Fail: {e}")
-            loop = asyncio.get_running_loop()
+        browser = None
+        for attempt in range(3):
+            try:
+                browser = await p.chromium.connect_over_cdp(ws_url, timeout=15000)
+                break
+            except Exception as e:
+                plog(pid, f"⚠️ CDP Connect timeout/refused (Attempt {attempt+1}/3). Retrying in 3s...")
+                await asyncio.sleep(3)
+                
+        if not browser:
+            plog(pid, f"❌ Playwright CDP Fail after 3 attempts.")
             await loop.run_in_executor(None, stop_profile, profile_id, token)
-            update_profile_status(pid, status="FAILED", error_msg=f"Browser Connect Error: {str(e)}")
+            update_profile_status(pid, status="FAILED", error_msg="CDP Connection Failed")
             return
 
         context = browser.contexts[0] if browser.contexts else await browser.new_context(
-            viewport=browser_cfg["viewport"], locale=browser_cfg["locale"], timezone_id=browser_cfg["timezone"],
+            viewport=browser_cfg.get("viewport"), locale=browser_cfg.get("locale"), timezone_id=browser_cfg.get("timezone")
         )
-
         await context.add_init_script(STEALTH_SCRIPT)
         page = context.pages[0] if context.pages else await context.new_page()
 
-        vp = browser_cfg["viewport"]
+        vp = browser_cfg.get("viewport", {"width": 1920, "height": 1080})
         await page.set_viewport_size({"width": vp["width"] + random.randint(-4, 4), "height": vp["height"] + random.randint(-4, 4)})
 
-        try:
-            # 🎲 THE ENTROPY MATRIX (TASK SELECTION)
-            sessions = []
-            
-            # --- STRIKE INJECTION ---
-            if strike_keyword and strike_channel:
-                sessions.append("youtube_strike")
-                plog(pid, f"🎯 Strike Mission Queued: {strike_keyword} -> {strike_channel}")
-            
-            if run_google: sessions.append("google")
-            
-            # Only add standard YouTube warm if we aren't doing a Strike, to prevent conflicting behaviors
-            if run_youtube and "youtube_strike" not in sessions: 
-                sessions.append("youtube")
-                
-            if run_wander: sessions.append("wander")
+        sessions = []
+        if strike_keyword and strike_channel:
+            sessions.append("youtube_strike")
+            plog(pid, f"🎯 STRIKE MISSION Queued: {strike_keyword} -> {strike_channel}")
+        
+        if run_google: sessions.append("google")
+        if run_youtube and "youtube_strike" not in sessions: sessions.append("youtube")
+        if run_wander: sessions.append("wander")
 
-            # Probability Signals
-            if random.random() < 0.20: sessions.append("newsletter")
-            if random.random() < 0.30: sessions.append("maps")
-            if random.random() < 0.15: sessions.append("workspace")
-            if random.random() < 0.10: sessions.append("calendar")
-            if random.random() < 0.25: sessions.append("news")
-            if random.random() < 0.30: sessions.append("gmail") 
-            if random.random() < 0.25: sessions.append("shopping")
-            if random.random() < 0.10: sessions.append("oauth")
-            if random.random() < 0.10: sessions.append("drive")
+        if random.random() < 0.20: sessions.append("newsletter")
+        if random.random() < 0.30: sessions.append("maps")
+        if random.random() < 0.15: sessions.append("workspace")
+        if random.random() < 0.10: sessions.append("calendar")
+        if random.random() < 0.25: sessions.append("news")
+        if random.random() < 0.30: sessions.append("gmail") 
+        if random.random() < 0.25: sessions.append("shopping")
+        if random.random() < 0.10: sessions.append("oauth")
+        if random.random() < 0.10: sessions.append("drive")
 
-            # Shuffle to ensure randomized human behavior ordering
-            random.shuffle(sessions)
+        random.shuffle(sessions) 
 
-            for session_type in sessions:
-                plog(pid, f"⚡ Active Task: {session_type.upper()}")
-                
+        for session_type in sessions:
+            plog(pid, f"⚡ Active Task: {session_type.upper()}")
+            
+            try:
                 if session_type == "google": await google_session(page, profile)
                 elif session_type == "youtube": await youtube_warm_session(page, profile, behavior, warm_day=warm_day)
-                elif session_type == "youtube_strike": await execute_target_strike(page, profile, strike_keyword, strike_channel)
+                # 🛡️ MATURATION UPGRADE: Passed warm_day into the strike function
+                elif session_type == "youtube_strike": await execute_target_strike(page, profile, strike_keyword, strike_channel, warm_day=warm_day)
                 elif session_type == "wander": await wander_session(page, profile) 
                 elif session_type == "newsletter": await subscribe_to_newsletter(page, profile)
                 elif session_type == "maps": await maps_warm_session(page, profile)
@@ -260,34 +247,38 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
                 elif session_type == "oauth": await oauth_warm_session(page, profile)
                 elif session_type == "drive": await drive_warm_session(page, profile)
 
-                # 📡 TRACKING: PUSH PROGRESS TO SUPABASE
                 completed_tasks.append(session_type)
-                update_profile_status(pid, status="RUNNING", tasks=completed_tasks)
+                
+                # 🛡️ DB BLOAT FIX: Removed intermediate updates to keep Supabase Free-Tier safe.
+                # update_profile_status(pid, status="RUNNING", tasks=completed_tasks)
+                
+            except PlaywrightTimeoutError:
+                plog(pid, f"⚠️ Task '{session_type}' timed out. Skipping to next module.")
+            except Exception as e:
+                plog(pid, f"⚠️ Task '{session_type}' encountered an error: {e}. Skipping.")
 
-                if len(sessions) > 1 and session_type != sessions[-1]:
-                    # 🚀 MODERATE PAUSE: 10-25 seconds (optimized for 8-hour max swarm time)
-                    pause = random.uniform(10, 25)
-                    plog(pid, f"⏸ Task Transition: {pause:.0f}s")
-                    await asyncio.sleep(pause)
+            if len(sessions) > 1 and session_type != sessions[-1]:
+                pause = random.uniform(8, 20)
+                plog(pid, f"⏸ Task Transition: {pause:.0f}s break...")
+                await asyncio.sleep(pause)
 
-            plog(pid, "✅ All tasks completed successfully.")
-            update_profile_status(pid, status="SUCCESS", tasks=completed_tasks)
+        plog(pid, "✅ Daily routine completed. Flushing cookies...")
+        update_profile_status(pid, status="SUCCESS", tasks=completed_tasks)
+        
+        try:
+            await page.close()
+            await context.close()
+            await browser.close()
+        except Exception: pass
+        
+        await loop.run_in_executor(None, stop_profile, profile_id, token)
+        plog(pid, "💾 Profile saved and stopped cleanly.")
 
-        except Exception as e:
-            plog(pid, f"⚠️ Session Error: {e}")
-            update_profile_status(pid, status="FAILED", tasks=completed_tasks, error_msg=str(e))
-
-        finally:
-            try: await browser.close()
-            except Exception: pass
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, stop_profile, profile_id, token)
-            plog(pid, "💾 Profile saved and exited.")
 
 # ---------------------------------------------------------------------------
 # ORCHESTRATOR
 # ---------------------------------------------------------------------------
-async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=15, region=None, strike_keyword=None, strike_channel=None):
+async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=15, region=None, strike_keyword=None, strike_channel=None, strike_window=2.0):
     log.info("🔑 Authenticating with Multilogin...")
     try:
         token = get_token()
@@ -295,9 +286,7 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
         log.error(f"❌ Auth Failed: {e}")
         return
 
-    # Passing the REGION filter into the Supabase fetcher
     profiles_to_run = fetch_active_profiles(selected_ids, region=region)
-    
     if not profiles_to_run:
         log.error(f"No active profiles found in database for region: {region or 'ALL'}.")
         return
@@ -306,9 +295,22 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
     sem = asyncio.Semaphore(max_concurrent)
 
     async def process_profile(profile):
+        # 📈 VIRAL VELOCITY CURVE: S-Curve Pacing for Strike Missions
+        base_stagger = random.uniform(1.0, 15.0) # Standard MLX port protection
+        
+        if strike_keyword:
+            # We use a Beta Distribution (alpha=2, beta=4) to simulate an organic viral spike.
+            # Start slow, spike sharply in the middle, and taper off with a long tail.
+            window_seconds = strike_window * 3600
+            velocity_delay = random.betavariate(2, 4) * window_seconds
+            stagger = base_stagger + velocity_delay
+            plog(profile["id"], f"🕒 Viral Velocity applied. Bot will launch in {stagger/60:.1f} minutes.")
+        else:
+            stagger = base_stagger
+            
+        await asyncio.sleep(stagger)
+        
         async with sem:
-            # 🚦 SAFE STAGGER: 1.0 to 10.0 seconds to protect local MLX API during launch
-            await asyncio.sleep(random.uniform(1.0, 10.0))
             await warm_profile(profile, token, run_google, run_youtube, run_wander, warm_day, strike_keyword, strike_channel)
             update_last_run(profile["id"])
             await asyncio.sleep(random.uniform(2, 5))
@@ -320,7 +322,7 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
 # ---------------------------------------------------------------------------
 # DAILY SCHEDULER
 # ---------------------------------------------------------------------------
-def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=15, region=None, strike_keyword=None, strike_channel=None):
+def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=15, region=None, strike_keyword=None, strike_channel=None, strike_window=2.0):
     run_time = os.getenv("SCHEDULE_TIME", "09:00").strip()
     log.info(f"📅 Scheduler active — Daily target: {run_time} | Region: {region or 'GLOBAL'}")
     
@@ -338,7 +340,7 @@ def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wand
         log.info(f"⏰ Next run: {actual_target.strftime('%H:%M:%S')} (in {wait/3600:.1f}h)")
         time.sleep(max(wait, 0))
         
-        asyncio.run(run_all(selected_ids, run_google, run_youtube, run_wander, current_day, max_concurrent=concurrency, region=region, strike_keyword=strike_keyword, strike_channel=strike_channel))
+        asyncio.run(run_all(selected_ids, run_google, run_youtube, run_wander, current_day, max_concurrent=concurrency, region=region, strike_keyword=strike_keyword, strike_channel=strike_channel, strike_window=strike_window))
         current_day += 1
 
 # ---------------------------------------------------------------------------
@@ -354,15 +356,14 @@ if __name__ == "__main__":
     parser.add_argument("--wander-only", action="store_true")
     parser.add_argument("--day", type=int, default=15)
     
-    # Defaults to 15 for optimal hardware utilization
     parser.add_argument("--concurrency", "-c", type=int, default=15)
+    parser.add_argument("--region", "-r", type=str, default=None, help="Filter bots by timezone (e.g., 'australia', 'america')")
     
-    # Filter bots by geographical timezone
-    parser.add_argument("--region", "-r", type=str, default=None, help="Filter bots by timezone (e.g., 'australia', 'america', 'europe')")
-    
-    # NEW: Targeted YouTube Strike Arguments
     parser.add_argument("--strike-keyword", type=str, default=None, help="Target search phrase for YouTube Strike")
     parser.add_argument("--strike-channel", type=str, default=None, help="Exact channel name for YouTube Strike verification")
+    
+    # NEW: Velocity Window Argument
+    parser.add_argument("--strike-window", type=float, default=2.0, help="Hours to organically spread the strike traffic across.")
 
     args = parser.parse_args()
 
@@ -371,19 +372,16 @@ if __name__ == "__main__":
     elif args.youtube_only: g, w = False, False
     elif args.wander_only: g, y = False, False
 
-    # Validate Strike Args (Requires both)
     if (args.strike_keyword and not args.strike_channel) or (args.strike_channel and not args.strike_keyword):
         log.error("❌ Strike Mission Error: You must provide BOTH --strike-keyword and --strike-channel.")
         exit(1)
 
     if args.dry_run:
-        # Pass region into the dry run test
         bots = fetch_active_profiles(args.profile, region=args.region)
         log.info(f"Dry-run: {len(bots)} profiles detected for region '{args.region or 'ALL'}'.")
         if args.strike_keyword:
-            log.info(f"Dry-run Strike Active: Targeting '{args.strike_keyword}' on channel '{args.strike_channel}'")
+            log.info(f"Dry-run Strike Active: Targeting '{args.strike_keyword}' on channel '{args.strike_channel}' over {args.strike_window} hours.")
     elif args.schedule:
-        run_scheduler(args.profile, g, y, w, args.day, args.concurrency, args.region, args.strike_keyword, args.strike_channel)
+        run_scheduler(args.profile, g, y, w, args.day, args.concurrency, args.region, args.strike_keyword, args.strike_channel, args.strike_window)
     else:
-        # Pass region and strike parameters into the main orchestrator execution
-        asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency, region=args.region, strike_keyword=args.strike_keyword, strike_channel=args.strike_channel))
+        asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency, region=args.region, strike_keyword=args.strike_keyword, strike_channel=args.strike_channel, strike_window=args.strike_window))

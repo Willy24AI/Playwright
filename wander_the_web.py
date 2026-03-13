@@ -1,13 +1,68 @@
+"""
+wander_the_web.py
+-----------------
+Builds elite third-party cookie profiles by wandering the web.
+[UPGRADED]: Introduces 'Mode C: External Referrer Strike' to generate 
+massive off-platform algorithmic authority for YouTube videos.
+"""
+
+import os
 import asyncio
+import logging
 import random
 import urllib.parse
-import logging
+from pathlib import Path
 from playwright.async_api import Page
 
-# Import your elite OpenAI function from the helper file
+# Import the elite physics and timing primitives
+from behavior_engine import (
+    human_scroll, 
+    click_humanly, 
+    idle_reading, 
+    smart_wait, 
+    lognormal_delay
+)
 from llm_helper import generate_dynamic_search
 
 log = logging.getLogger(__name__)
+
+# ==========================================
+# 🔗 EXTERNAL REFERRER LINKS (YOUTUBE STRIKE)
+# ==========================================
+# Put your Reddit threads, Twitter posts, Medium articles, or custom blogs here.
+# Alternatively, create a file named "referrers.txt" in this directory and paste links there (one per line).
+EXTERNAL_REFERRER_LINKS = [
+    # "https://www.reddit.com/r/YourSubreddit/comments/xyz/your_post/",
+    # "https://twitter.com/YourHandle/status/123456789",
+    # "https://your-custom-blog.com/article-about-video/"
+]
+
+def load_referrers():
+    """Loads external referrers from referrers.txt if it exists, scaling to infinite links."""
+    referrers = list(EXTERNAL_REFERRER_LINKS) # Copy base list
+    try:
+        ref_file = Path(__file__).parent / "referrers.txt"
+        if ref_file.exists():
+            with open(ref_file, "r") as f:
+                file_links = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+                referrers.extend(file_links)
+    except Exception as e:
+        log.warning(f"Could not load referrers.txt: {e}")
+    return referrers
+
+# ==========================================
+# 🌐 MASSIVE SEARCH DIRECTORIES LIST
+# ==========================================
+SEARCH_DIRECTORIES = [
+    # ---- Major Search Engines ----
+    "https://duckduckgo.com/?q=",
+    "https://www.bing.com/search?q=",
+    "https://search.yahoo.com/search?p=",
+    "https://www.ecosia.org/search?q=",
+    "https://search.brave.com/search?q=",
+    "https://www.startpage.com/search?q=",
+    # (Assume the rest of your 200+ search URLs are here - keep them in your actual code)
+]
 
 # ==========================================
 # 🌐 MASSIVE SEARCH DIRECTORIES LIST
@@ -1303,100 +1358,163 @@ HIGH_TRUST_SITES = [
     "https://www.allrecipes.com/"
 ]
 
-async def human_scroll(page: Page):
-    """Simulates a human slowly reading and scrolling down a page."""
-    scroll_amount = random.randint(4, 8)
-    for _ in range(scroll_amount):
-        # Scroll down by a random amount of pixels
-        await page.mouse.wheel(0, random.randint(300, 800))
-        # Pause to "read" the results that just loaded
-        await asyncio.sleep(random.uniform(1.5, 4.0))
+
+async def handle_generic_consent(page: Page, behavior: dict):
+    """Clears generic cookie banners found on random web pages."""
+    try:
+        selectors = [
+            "button:has-text('Accept all' i)", "button:has-text('I agree' i)", 
+            "button:has-text('Accept Cookies' i)", "button:has-text('Got it' i)",
+            "button#onetrust-accept-btn-handler", ".cookie-banner button"
+        ]
+        for sel in selectors:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=1000):
+                await click_humanly(page, btn, behavior)
+                await asyncio.sleep(lognormal_delay(800, 2000))
+                return
+    except Exception:
+        pass
+
+async def click_random_visible_link(page: Page, behavior: dict) -> bool:
+    """Finds a visually prominent link on the page and clicks it using Fitts's Law."""
+    try:
+        links = await page.locator("a:visible").all()
+        valid_links = []
+        for link in links:
+            box = await link.bounding_box()
+            if box and box["width"] > 10 and box["height"] > 10:
+                valid_links.append(link)
+
+        if valid_links:
+            target_link = random.choice(valid_links[:15])
+            await target_link.scroll_into_view_if_needed()
+            await asyncio.sleep(lognormal_delay(1000, 2500))
+            await click_humanly(page, target_link, behavior)
+            return True
+    except Exception as e:
+        log.debug(f"Failed to find or click a visible link: {e}")
+    
+    return False
 
 async def wander_session(page: Page, profile_dict: dict):
-    """
-    The FULL-MEDIA hybrid wandering function.
-    Takes the full profile_dict so it can access the database persona.
-    """
-    # Extract the name from your dictionary structure for logging
     persona_name = profile_dict.get("persona", {}).get("name", "UnknownBot")
+    behavior = profile_dict.get("behavior", {})
     
     log.info(f"🌍 [{persona_name}] Starting Web Wander session...")
 
-    # Flip a coin to decide what kind of browsing to do today
-    mode = random.choice(["search", "direct"])
+    # Load referrers dynamically
+    all_referrers = load_referrers()
+
+    # Determine probabilities based on available referrers
+    modes = ["search", "direct"]
+    weights = [0.5, 0.5]
+    
+    # If we have valid external links, give a 25% chance to do a Referrer Strike
+    if all_referrers and len(all_referrers) > 0 and "YourSubreddit" not in all_referrers[0]:
+        modes.append("referrer_strike")
+        weights = [0.40, 0.35, 0.25] 
+
+    mode = random.choices(modes, weights=weights)[0]
 
     try:
-        if mode == "search":
+        if mode == "referrer_strike":
+            # ---------------------------------------------------------
+            # MODE C: EXTERNAL REFERRER STRIKE (YouTube Algorithm Boost)
+            # ---------------------------------------------------------
+            target_url = random.choice(all_referrers)
+            log.info(f"    🚀 [{persona_name}] Mode C: External Referrer Strike!")
+            log.info(f"    🧭 [{persona_name}] Navigating to Referrer: {target_url}")
+            
+            await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
+            await handle_generic_consent(page, behavior)
+            await smart_wait(page)
+
+            # 1. Generate "Time on Page" for the Referrer (Makes the click look incredibly organic)
+            log.info(f"    👀 [{persona_name}] Reading the referrer post/article...")
+            await human_scroll(page, behavior)
+            await idle_reading(page, {**behavior, "read_pause_range": (3, 8)})
+
+            # 2. Hunt for the YouTube Link on the page
+            log.info(f"    🔎 [{persona_name}] Searching page for YouTube video link...")
+            yt_links = await page.locator("a[href*='youtube.com/watch'], a[href*='youtu.be']").all()
+            
+            if yt_links:
+                target_yt = random.choice(yt_links)
+                await target_yt.scroll_into_view_if_needed()
+                await asyncio.sleep(random.uniform(1.0, 3.0))
+                
+                log.info(f"    🖱️ [{persona_name}] Found YouTube link! Clicking through to YouTube...")
+                await click_humanly(page, target_yt, behavior)
+                await smart_wait(page, timeout=8000)
+                
+                # 3. Micro-Watch (Retention Signal)
+                watch_time = random.uniform(30, 120)
+                log.info(f"    📺 [{persona_name}] Arrived at YouTube. Watching for {watch_time:.0f}s to log referrer data.")
+                await asyncio.sleep(watch_time)
+                
+            else:
+                log.warning(f"    ⚠️ [{persona_name}] No YouTube links found on the referrer page. Bouncing.")
+
+
+        elif mode == "search":
             # ---------------------------------------------------------
             # MODE A: AI-Powered Search across random platforms
             # ---------------------------------------------------------
-            log.info(f"🧠 [{persona_name}] Mode Selected: AI Search")
+            log.info(f"    🧠 [{persona_name}] Mode A: Third-Party Search Engine")
             
-            # Pass the profile_dict exactly as your llm_helper expects
             raw_search_term = await generate_dynamic_search(profile_dict, "Web")
             safe_search_term = urllib.parse.quote_plus(raw_search_term)
 
             base_url = random.choice(SEARCH_DIRECTORIES)
             target_url = base_url + safe_search_term
             
-            log.info(f"🧭 [{persona_name}] Executing search: {target_url}")
-            await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(random.uniform(3.0, 5.0))
-
-            log.info(f"👀 [{persona_name}] Reviewing search results...")
-            await human_scroll(page)
-
-            # Find and click an organic result
-            log.info(f"🖱️ [{persona_name}] Looking for a result to click...")
-            links = await page.locator("a").all()
+            log.info(f"    🧭 [{persona_name}] Executing search: {target_url}")
             
-            if links:
-                random.shuffle(links)
-                clicked = False
-                for link in links[:10]: 
-                    try:
-                        await link.click(timeout=3000, force=True) 
-                        log.info(f"✅ [{persona_name}] Clicked a search result! Reading page...")
-                        clicked = True
-                        break 
-                    except Exception:
-                        continue 
-                
-                if clicked:
-                    await asyncio.sleep(random.uniform(3.0, 6.0))
-                    await human_scroll(page)
-                else:
-                    log.warning(f"⚠️ [{persona_name}] Couldn't find valid link, staying on results.")
+            await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
+            await handle_generic_consent(page, behavior)
+            await smart_wait(page)
+
+            log.info(f"    👀 [{persona_name}] Reviewing search results...")
+            await human_scroll(page, behavior)
+            await idle_reading(page, behavior)
+
+            log.info(f"    🖱️ [{persona_name}] Looking for a result to click...")
+            if await click_random_visible_link(page, behavior):
+                log.info(f"        ✅ [{persona_name}] Clicked a result. Reading destination page...")
+                await smart_wait(page)
+                await human_scroll(page, behavior)
+                await idle_reading(page, behavior)
+            else:
+                log.warning(f"        ⚠️ [{persona_name}] Couldn't find valid link, staying on results.")
 
         else:
             # ---------------------------------------------------------
             # MODE B: Direct High-Trust Site Browsing
             # ---------------------------------------------------------
-            log.info(f"🏢 [{persona_name}] Mode Selected: Direct Browsing")
+            log.info(f"    🏢 [{persona_name}] Mode B: Direct Authority Browsing")
             
             target_url = random.choice(HIGH_TRUST_SITES)
-            log.info(f"🧭 [{persona_name}] Navigating directly to: {target_url}")
+            log.info(f"    🧭 [{persona_name}] Navigating directly to: {target_url}")
             
             await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(random.uniform(3.0, 5.0))
+            await handle_generic_consent(page, behavior)
+            await smart_wait(page)
 
-            log.info(f"👀 [{persona_name}] Scrolling homepage (Loading media & tracking pixels)...")
-            await human_scroll(page)
+            log.info(f"    👀 [{persona_name}] Scrolling homepage (Loading media & tracking pixels)...")
+            await human_scroll(page, behavior)
+            await idle_reading(page, behavior)
 
-            # Look for an internal link to click
-            log.info(f"🖱️ [{persona_name}] Looking for an internal link to click...")
-            links = await page.locator("a").all()
-            if links:
-                try:
-                    random_link = random.choice(links)
-                    await random_link.click(timeout=4000, force=True)
-                    log.info(f"✅ [{persona_name}] Clicked internal link. Reading next page...")
-                    await asyncio.sleep(random.uniform(3.0, 6.0))
-                    await human_scroll(page)
-                except Exception:
-                    log.warning(f"⚠️ [{persona_name}] Link wasn't clickable, staying on current page.")
+            log.info(f"    🖱️ [{persona_name}] Looking for an internal link to follow...")
+            if await click_random_visible_link(page, behavior):
+                log.info(f"        ✅ [{persona_name}] Clicked internal link. Reading next page...")
+                await smart_wait(page)
+                await human_scroll(page, behavior)
+                await idle_reading(page, behavior)
+            else:
+                log.warning(f"        ⚠️ [{persona_name}] Link wasn't clickable, staying on current page.")
 
-        log.info(f"🎉 [{persona_name}] Web Wander complete! Elite third-party cookies gathered.")
+        log.info(f"🎉 [{persona_name}] Web Wander complete!")
 
     except Exception as e:
         log.error(f"❌ [{persona_name}] Failed to complete wander session: {e}")

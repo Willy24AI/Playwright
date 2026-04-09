@@ -1,85 +1,117 @@
-"""
-generate_farm.py
-----------------
-Automated pipeline to generate 1000 unique profiles and push them to Supabase.
-"""
 import os
 import json
 import random
 import asyncio
+import time
+import requests
 from dotenv import load_dotenv
 from pathlib import Path
 from openai import AsyncOpenAI
 from supabase import create_client, Client
 
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+# Load environment variables
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# 1. Initialize Clients
-openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+if not all([OPENAI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
+    raise ValueError("Missing API Keys in .env file.")
 
-# 2. Define Base Archetypes (Controls physical behavior and topic direction)
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ==========================================
+# 1. BEHAVIORAL ARCHETYPES
+# ==========================================
 ARCHETYPES = [
     {
         "name": "Tech/Gamer (Gen Z)",
-        "prompt_vibe": "a 18-25 year old obsessed with PC building, coding, and competitive gaming.",
+        "prompt_vibe": "an 18-25 year old obsessed with PC building, coding, and competitive gaming.",
         "behavior": {
-            "wpm_range": [85, 115], "typo_rate": 0.07, "typo_correction_delay": [100, 300],
-            "scroll_chunk": [200, 400], "scroll_sessions": [4, 8], "back_scroll_chance": 0.15,
-            "read_pause_range": [8, 20], "idle_drift_chance": 0.40, "pre_click_hover_ms": [100, 300],
-            "result_position_weights": [4, 4, 3, 3, 3, 2, 2, 1],
+            "typing_base_wpm": 95, "typing_error_rate": 0.04,
+            "fitts_overshoot_probability": 0.05, "fitts_correction_speed": 1.2,
+            "tab_switch_frequency": 0.45, "dwell_time_modifier": 0.8
         }
     },
     {
         "name": "DIY/Homeowner (Boomer/Gen X)",
         "prompt_vibe": "a 45-65 year old who loves woodworking, lawn care, classic cars, and grilling.",
         "behavior": {
-            "wpm_range": [20, 35], "typo_rate": 0.10, "typo_correction_delay": [600, 1500],
-            "scroll_chunk": [80, 200], "scroll_sessions": [3, 6], "back_scroll_chance": 0.22,
-            "read_pause_range": [15, 35], "idle_drift_chance": 0.45, "pre_click_hover_ms": [400, 800],
-            "result_position_weights": [6, 5, 4, 3, 2, 1, 1, 1],
+            "typing_base_wpm": 30, "typing_error_rate": 0.12,
+            "fitts_overshoot_probability": 0.22, "fitts_correction_speed": 0.8,
+            "tab_switch_frequency": 0.10, "dwell_time_modifier": 1.8
         }
     },
     {
         "name": "Lifestyle/Design (Millennial)",
         "prompt_vibe": "a 25-35 year old into interior design, specialty coffee, productivity, and aesthetics.",
         "behavior": {
-            "wpm_range": [65, 90], "typo_rate": 0.04, "typo_correction_delay": [180, 450],
-            "scroll_chunk": [180, 420], "scroll_sessions": [3, 6], "back_scroll_chance": 0.10,
-            "read_pause_range": [10, 25], "idle_drift_chance": 0.35, "pre_click_hover_ms": [150, 400],
-            "result_position_weights": [5, 5, 4, 3, 3, 2, 1, 1],
+            "typing_base_wpm": 75, "typing_error_rate": 0.03,
+            "fitts_overshoot_probability": 0.10, "fitts_correction_speed": 1.0,
+            "tab_switch_frequency": 0.30, "dwell_time_modifier": 1.1
         }
     }
 ]
 
-# Timezones to randomly assign
-TIMEZONES = [
-    ("America/New_York", "en-US"), 
-    ("America/Chicago", "en-US"), 
-    ("America/Denver", "en-US"), 
-    ("America/Los_Angeles", "en-US")
-]
+# ==========================================
+# 2. UTILITY FUNCTIONS
+# ==========================================
+def parse_webshare_proxies(filepath="webshare_proxies.txt"):
+    """Loads and formats the proxies."""
+    proxies = []
+    try:
+        with open(filepath, 'r') as file:
+            for line in file:
+                parts = line.strip().split(':')
+                if len(parts) >= 4:
+                    proxies.append({
+                        'proxy_ip': parts[0], 'proxy_port': parts[1],
+                        'proxy_user': parts[2], 'proxy_pass': parts[3]
+                    })
+    except FileNotFoundError:
+        print(f"Error: {filepath} not found.")
+    return proxies
 
-async def generate_single_profile(mlx_id: str, index: int):
-    """Generates the AI persona and pushes it to Supabase."""
-    archetype = random.choice(ARCHETYPES)
-    tz, locale = random.choice(TIMEZONES)
+def get_location_from_ip(ip_address):
+    """Resolves IP safely (45 requests per minute limit)."""
+    try:
+        res = requests.get(f"http://ip-api.com/json/{ip_address}").json()
+        if res.get('status') == 'success':
+            return res.get('city'), res.get('regionName'), res.get('timezone')
+    except Exception:
+        pass
+    return "Austin", "Texas", "America/Chicago" # Fallback
+
+# ==========================================
+# 3. OPENAI PERSONA GENERATION
+# ==========================================
+async def generate_ai_persona(profile_id, proxy_data, index):
+    """Fuses proxy location with OpenAI personality generation."""
     
-    # Prompt OpenAI to return a JSON object with the persona data
+    # 1. Get the exact location of the proxy IP
+    ip = proxy_data['proxy_ip']
+    city, state, timezone = get_location_from_ip(ip)
+    
+    # 2. Pick an archetype
+    archetype = random.choice(ARCHETYPES)
+    
+    # 3. Prompt OpenAI strictly with the IP's location
     prompt = f"""
     You are generating a synthetic internet user for a simulation.
     Target Archetype: {archetype['prompt_vibe']}
+    CRITICAL LOCATION RULE: This person lives specifically in {city}, {state}.
     
-    Output a raw JSON object (NO markdown formatting, NO code blocks, just raw JSON) with this exact structure:
+    Output a raw JSON object (NO markdown, NO code blocks) with this exact structure:
     {{
-        "id": "firstname_city", (e.g., 'dave_austin', all lowercase)
-        "persona": {{
-            "name": "Firstname",
-            "age": integer,
-            "city": "US City Name"
-        }},
+        "username": "firstname_lastname_year",
+        "name": "Firstname Lastname",
+        "gender": "Male or Female",
+        "age": integer,
+        "occupation": "A realistic job title",
         "topics": [
-            15 highly specific, niche youtube search topics this person would care about. Mix hobbies, career, and local city searches.
+            10 highly specific, niche Google/YouTube search topics. 
+            Mix their archetype hobbies with hyper-local {city} searches (e.g., local restaurants, local news, local stores).
         ]
     }}
     """
@@ -88,57 +120,82 @@ async def generate_single_profile(mlx_id: str, index: int):
         response = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.9
+            temperature=0.8
         )
         
-        # Parse the JSON response from OpenAI
         raw_text = response.choices[0].message.content.strip()
         if raw_text.startswith("```json"):
-            raw_text = raw_text[7:-3].strip() # Clean up markdown if LLM misbehaves
+            raw_text = raw_text[7:-3].strip()
             
         ai_data = json.loads(raw_text)
         
-        # Build the final profile object
+        # 4. Map everything to our Supabase database schema
         final_profile = {
-            "id": ai_data["id"] + f"_{index}", # Ensure unique ID just in case (e.g., dave_austin_42)
-            "mlx_profile_id": mlx_id,
-            "persona": ai_data["persona"],
-            "browser": {
-                "timezone": tz,
-                "locale": locale,
-                "viewport": {"width": random.choice([1280, 1366, 1440, 1536, 1920]), 
-                             "height": random.choice([720, 768, 864, 900, 1080])}
+            "profile_id": f"PR-{str(index).zfill(4)}",
+            "network": proxy_data,
+            "location": {
+                "country": "US",
+                "state": state,
+                "city": city,
+                "timezone": timezone
             },
-            "behavior": archetype["behavior"],
-            "topics": ai_data["topics"],
-            "is_active": True
+            "demographics": {
+                "username": ai_data["username"],
+                "name": ai_data["name"],
+                "gender": ai_data["gender"],
+                "occupation": ai_data["occupation"],
+                "interests": ai_data["topics"] # The 10 AI-generated local topics
+            },
+            "behavioral_metrics": archetype["behavior"],
+            "status": "available"
         }
         
-        # Push to Supabase
-        supabase.table("bot_profiles").upsert(final_profile).execute()
-        print(f"✅ Generated & Uploaded [{index}]: {final_profile['id']} ({archetype['name']})")
+        return final_profile
         
     except Exception as e:
-        print(f"❌ Failed on index {index} (MLX: {mlx_id}): {e}")
+        print(f"❌ Failed to generate AI profile for IP {ip}: {e}")
+        return None
 
+# ==========================================
+# 4. ORCHESTRATION
+# ==========================================
 async def main():
-    # 1. Provide your list of 1000 Multilogin IDs here. 
-    # (In reality, you could export a CSV from MLX and load it here, or call the MLX API to list all profiles).
-    # For demonstration, here are dummy IDs:
-    mlx_ids = [f"mlx-uuid-100{i}" for i in range(1000)] 
-    
-    print(f"🚀 Starting generation of {len(mlx_ids)} profiles...")
-    
-    # Process in batches of 10 concurrently so we don't hit OpenAI API limits
-    batch_size = 10
-    for i in range(0, len(mlx_ids), batch_size):
-        batch = mlx_ids[i:i + batch_size]
-        tasks = [generate_single_profile(mlx_id, i + j) for j, mlx_id in enumerate(batch)]
-        await asyncio.gather(*tasks)
-        print(f"⏳ Batch complete. Pausing to respect API rate limits...")
-        await asyncio.sleep(2) # Brief pause to avoid 429 Rate Limit errors from OpenAI
+    proxy_list = parse_webshare_proxies()
+    if not proxy_list:
+        return
         
-    print("🏁 All 1,000 profiles successfully generated and stored in Supabase!")
+    total_proxies = len(proxy_list)
+    print(f"🚀 Loaded {total_proxies} proxies. Starting Smart Generation Pipeline...")
+    
+    final_personas = []
+    
+    # We must process sequentially with a small delay because ip-api.com 
+    # will block us if we fire 500 IP lookups concurrently.
+    for i, proxy_data in enumerate(proxy_list, 1):
+        print(f"Generating Profile {i}/{total_proxies} (IP: {proxy_data['proxy_ip']})...")
+        
+        persona = await generate_ai_persona(f"PR-{str(i).zfill(4)}", proxy_data, i)
+        if persona:
+            final_personas.append(persona)
+            
+        # 1.5s delay to stay safely under 45 requests/minute for IP resolution
+        await asyncio.sleep(1.5) 
+        
+    print("\n✅ All personas generated. Pushing directly to Supabase...")
+    
+    # Upsert the entire batch directly to your database
+    try:
+        supabase.table('profiles').upsert(final_personas).execute()
+        print(f"🏁 SUCCESS: {len(final_personas)} highly-entropic, geo-locked profiles stored in Supabase!")
+    except Exception as e:
+        print(f"❌ Database Upload Error: {e}")
+        
+        # Emergency backup: Save to file if DB fails
+        with open("emergency_backup_personas.json", "w") as f:
+            json.dump(final_personas, f, indent=4)
+        print("Data saved locally to emergency_backup_personas.json instead.")
 
 if __name__ == "__main__":
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())

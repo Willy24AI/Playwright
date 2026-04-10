@@ -1,112 +1,230 @@
 import os
-import requests
+import hashlib
+import asyncio
 import time
+import httpx
+from dotenv import load_dotenv
 from supabase import create_client
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-MLA_API_PORT = 35000
+# Load Environment Variables
+load_dotenv()
+SUPABASE_URL     = os.getenv("SUPABASE_URL")
+SUPABASE_KEY     = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+MLX_EMAIL        = os.getenv("MLX_EMAIL")
+MLX_PASSWORD     = os.getenv("MLX_PASSWORD")
+MLX_FOLDER_ID    = os.getenv("MLX_FOLDER_ID")
+MLX_WORKSPACE_ID = os.getenv("MLX_WORKSPACE_ID")
+
+MLX_CLOUD_API = "https://api.multilogin.com"
+TOKEN_REFRESH_INTERVAL = 15
+MAX_RETRIES = 15
+RETRY_DELAY = 1.0
+
+if not all([SUPABASE_URL, SUPABASE_KEY, MLX_EMAIL, MLX_PASSWORD, MLX_FOLDER_ID]):
+    raise ValueError("Missing credentials in .env - check SUPABASE and MLX variables.")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def load_google_accounts(filepath):
-    """Loads Google accounts from a text file."""
-    accounts = []
-    try:
-        with open(filepath, 'r') as f:
-            for line in f:
-                parts = line.strip().split(':')
-                if len(parts) >= 3:
-                    accounts.append({
-                        'email': parts[0],
-                        'password': parts[1],
-                        'recovery': parts[2]
-                    })
-    except FileNotFoundError:
-        print(f"Error: Could not find {filepath}.")
-    return accounts
 
-def create_multilogin_profile(profile_name, proxy_data):
+def curl_post(url: str, payload: dict, token: str = None) -> dict | None:
+    """POST via httpx with retry logic and SSL bypass.
+    - Fresh client per attempt prevents connection pool poisoning.
+    - Accepts both 200 and 201 as success (MLX profile/create returns 201).
+    - 400/401 bail immediately — retrying won't help.
+    - Catches httpx.ReadError explicitly in addition to string-matching.
     """
-    Sends a POST request to Multilogin's local API to create a new profile.
-    Uses 'mimic' (Chromium) and 'win' (Windows).
-    """
-    url = f"http://127.0.0.1:{MLA_API_PORT}/api/v2/profile"
-    
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with httpx.Client(verify=False, timeout=30, trust_env=False) as client:
+                response = client.post(url, json=payload, headers=headers)
+
+            # ✅ FIXED: MLX /profile/create returns 201, not 200
+            if response.status_code in (200, 201):
+                return response.json()
+
+            # Validation errors — retrying the same payload will never fix these
+            if response.status_code in (400, 401):
+                print(f"⚠️ API returned {response.status_code}: {response.text[:200]}")
+                return None
+
+            print(f"⚠️ API returned {response.status_code}: {response.text[:200]}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+                continue
+            return None
+
+        except (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            # ✅ FIXED: Catch httpx transport errors explicitly so they always retry
+            print(f"  Network hiccup (attempt {attempt}/{MAX_RETRIES}): {str(e)[:50]}... retrying")
+            time.sleep(RETRY_DELAY)
+            continue
+
+        except Exception as e:
+            err = str(e)
+            retry_keywords = ["BAD_RECORD_MAC", "SSL", "disconnected", "RemoteProtocolError", "Connection reset"]
+            if any(k in err for k in retry_keywords):
+                print(f"  Network hiccup (attempt {attempt}/{MAX_RETRIES}): {err[:50]}... retrying")
+                time.sleep(RETRY_DELAY)
+                continue
+            print(f"❌ Unexpected error: {e}")
+            return None
+
+    return None
+
+
+def get_mlx_token() -> tuple[str | None, str | None]:
+    """Authenticate and return (token, workspace_id)."""
+    print("🔑 Authenticating with Multilogin X Cloud API...")
+    hashed = hashlib.md5(MLX_PASSWORD.strip().encode()).hexdigest()
+    data = curl_post(f"{MLX_CLOUD_API}/user/signin", {"email": MLX_EMAIL.strip(), "password": hashed})
+
+    if not data or 'data' not in data:
+        print(f"❌ Auth failed. Response: {data}")
+        return None, None
+
+    inner = data.get('data', {})
+    token = inner.get('token')
+    workspace_id = inner.get('workspace_id') or MLX_WORKSPACE_ID
+
+    print(f"✅ Authenticated! Workspace: {workspace_id}")
+    return token, workspace_id
+
+
+def sanitize_proxy_field(value) -> str:
+    """Strip HTML/whitespace from proxy fields."""
+    if not value: return ""
+    return str(value).strip().replace("<", "").replace(">", "").replace("&", "")
+
+
+def create_mlx_profile(persona, token, workspace_id):
+    """Creates a profile via the MLX Cloud API with strict proxy parameters."""
+    network = persona.get('network', {})
+
+    proxy_ip = network.get('proxy_ip')
+    print(f"DEBUG: Preparing [{persona['profile_id']}] | Proxy IP: {proxy_ip}")
+
+    if not proxy_ip:
+        print(f"❌ ERROR: Profile {persona['profile_id']} has NO proxy data in Supabase. Skipping.")
+        return None
+
+    try:
+        proxy_port = int(str(network.get('proxy_port', 0)).strip())
+    except ValueError:
+        print(f"⚠️ Invalid port for {persona['profile_id']}")
+        return None
+
     payload = {
-        "name": profile_name,
-        "browser": "mimic",
-        "os": "win",
-        "enableLock": True,
-        "network": {
-            "proxy": {
-                "type": "HTTP",
-                "host": proxy_data['proxy_ip'],
-                "port": str(proxy_data['proxy_port']),
-                "username": proxy_data['proxy_user'],
-                "password": proxy_data['proxy_pass']
+        "name": persona['profile_id'],
+        "workspace_id": workspace_id,
+        "folder_id": MLX_FOLDER_ID,
+        "browser_type": "mimic",
+        "os_type": "windows",
+        "proxy": {
+            "type": "HTTP",
+            "host": sanitize_proxy_field(proxy_ip),
+            "port": proxy_port,
+            "username": sanitize_proxy_field(network.get('proxy_user', '')),
+            "password": sanitize_proxy_field(network.get('proxy_pass', ''))
+        },
+        "parameters": {
+            "flags": {
+                "audio_masking":  "mask",
+                "canvas_masking": "noise",
+                "webgl_masking":  "noise",
+                "webrtc_masking": "mask"
             }
         }
     }
 
-    try:
-        response = requests.post(url, json=payload)
-        data = response.json()
-        if response.status_code == 200 and 'uuid' in data:
-            return data['uuid']
-        else:
-            print(f"MLA API Error: {data}")
-            return None
-    except Exception as e:
-        print(f"Failed to connect to Multilogin API: {e}")
+    data = curl_post(f"{MLX_CLOUD_API}/profile/create", payload, token=token)
+    if not data:
         return None
 
-def main():
-    accounts = load_google_accounts("google_accounts.txt")
-    if not accounts:
+    # ✅ FIXED: MLX returns {"data": {"ids": ["uuid"]}} — extract from ids list
+    inner_data = data.get("data", {})
+    ids = inner_data.get("ids", [])
+    if ids:
+        return ids[0]
+
+    # Fallback for older API response shapes
+    return inner_data.get("id") or inner_data.get("uuid")
+
+
+async def main():
+    # Load Google Accounts
+    accounts = []
+    try:
+        with open("google_accounts.txt", 'r') as f:
+            for line in f:
+                parts = line.strip().split(':')
+                if len(parts) >= 2:
+                    accounts.append({
+                        'email': parts[0],
+                        'password': parts[1],
+                        'recovery': parts[2] if len(parts) > 2 else ""
+                    })
+    except FileNotFoundError:
+        print("❌ Error: google_accounts.txt not found.")
         return
 
-    # Fetch profiles that don't have an MLA UUID assigned yet
+    token, workspace_id = get_mlx_token()
+    if not token or not workspace_id:
+        return
+
+    print("🚀 Fetching profiles from Supabase where mla_uuid is null...")
     response = supabase.table('profiles').select('*').is_('mla_uuid', 'null').execute()
-    unassigned_profiles = response.data
-    
-    if not unassigned_profiles:
-        print("All profiles in Supabase already have an mla_uuid assigned.")
+    personas = response.data
+
+    if not personas:
+        print("✅ All profiles already have a Multilogin UUID!")
         return
 
-    print(f"Found {len(unassigned_profiles)} pending profiles. Creating in Multilogin...")
+    print(f"Found {len(personas)} profiles to build.\n")
 
-    for i, db_profile in enumerate(unassigned_profiles):
+    success_count = 0
+    for i, persona in enumerate(personas):
         if i >= len(accounts):
-            print("Ran out of Google accounts before finishing all profiles!")
+            print("⚠️ Ran out of Google Accounts.")
             break
-            
-        account = accounts[i]
-        profile_name = db_profile['profile_id'] # e.g., PR-0001
-        proxy_data = db_profile['network']
-        
-        print(f"Creating MLA profile for {profile_name}...")
-        
-        # 1. Create the profile in Multilogin
-        mla_uuid = create_multilogin_profile(profile_name, proxy_data)
-        
+
+        # Periodic Re-auth
+        if i > 0 and i % TOKEN_REFRESH_INTERVAL == 0:
+            print("🔄 Refreshing Auth Token...")
+            new_token, _ = get_mlx_token()
+            if new_token:
+                token = new_token
+
+        g_acc = accounts[i]
+        print(f"[{i+1}/{len(personas)}] Creating {persona['profile_id']}...")
+
+        mla_uuid = create_mlx_profile(persona, token, workspace_id)
+
         if mla_uuid:
-            # 2. Update Supabase with the new UUID and Google credentials
             supabase.table('profiles').update({
                 'mla_uuid': mla_uuid,
-                'google_email': account['email'],
-                'google_password': account['password'],
-                'google_recovery': account['recovery']
-            }).eq('id', db_profile['id']).execute()
-            
-            print(f"Success: Linked {account['email']} to {profile_name} (UUID: {mla_uuid})")
+                'google_email': g_acc['email'],
+                'google_password': g_acc['password'],
+                'google_recovery': g_acc['recovery'],
+                'status': 'available'
+            }).eq('id', persona['id']).execute()
+            print(f"   ✅ Created: {mla_uuid}")
+            success_count += 1
         else:
-            print(f"Failed to create Multilogin profile for {profile_name}.")
-            
-        # Brief pause to avoid overwhelming the local API
-        time.sleep(1)
+            print(f"   ❌ FAILED: {persona['profile_id']}")
 
-    print("Multilogin profile generation complete.")
+        await asyncio.sleep(2)  # Prevent API rate limit triggers
+
+    print(f"\n🏁 Finished! ✅ {success_count} Created.")
+
 
 if __name__ == "__main__":
-    main()
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())

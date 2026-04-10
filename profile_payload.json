@@ -1,0 +1,1 @@
+{"name":"TEST-001","browser_type":"mimic","os_type":"windows","proxy":{"type":"HTTP","host":"1.2.3.4","port":8080,"username":"user","password":"pass"}}

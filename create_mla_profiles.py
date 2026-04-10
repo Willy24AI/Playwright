@@ -27,12 +27,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def curl_post(url: str, payload: dict, token: str = None) -> dict | None:
-    """POST via httpx with retry logic and SSL bypass.
-    - Fresh client per attempt prevents connection pool poisoning.
-    - Accepts both 200 and 201 as success (MLX profile/create returns 201).
-    - 400/401 bail immediately — retrying won't help.
-    - Catches httpx.ReadError explicitly in addition to string-matching.
-    """
+    """POST via httpx with retry logic and SSL bypass."""
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json"
@@ -45,11 +40,9 @@ def curl_post(url: str, payload: dict, token: str = None) -> dict | None:
             with httpx.Client(verify=False, timeout=30, trust_env=False) as client:
                 response = client.post(url, json=payload, headers=headers)
 
-            # ✅ FIXED: MLX /profile/create returns 201, not 200
             if response.status_code in (200, 201):
                 return response.json()
 
-            # Validation errors — retrying the same payload will never fix these
             if response.status_code in (400, 401):
                 print(f"⚠️ API returned {response.status_code}: {response.text[:200]}")
                 return None
@@ -61,7 +54,6 @@ def curl_post(url: str, payload: dict, token: str = None) -> dict | None:
             return None
 
         except (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError) as e:
-            # ✅ FIXED: Catch httpx transport errors explicitly so they always retry
             print(f"  Network hiccup (attempt {attempt}/{MAX_RETRIES}): {str(e)[:50]}... retrying")
             time.sleep(RETRY_DELAY)
             continue
@@ -104,7 +96,7 @@ def sanitize_proxy_field(value) -> str:
 
 
 def create_mlx_profile(persona, token, workspace_id):
-    """Creates a profile via the MLX Cloud API with strict proxy parameters."""
+    """Creates a profile via the MLX Cloud API with full fingerprint settings."""
     network = persona.get('network', {})
 
     proxy_ip = network.get('proxy_ip')
@@ -120,40 +112,73 @@ def create_mlx_profile(persona, token, workspace_id):
         print(f"⚠️ Invalid port for {persona['profile_id']}")
         return None
 
+    # Get proxy credentials
+    proxy_user = sanitize_proxy_field(network.get('proxy_user', ''))
+    proxy_pass = sanitize_proxy_field(network.get('proxy_pass', ''))
+
+    # ✅ FULL ENHANCED PAYLOAD with all fingerprint masking settings
+    # Based on official Multilogin X support template
     payload = {
         "name": persona['profile_id'],
         "workspace_id": workspace_id,
         "folder_id": MLX_FOLDER_ID,
         "browser_type": "mimic",
         "os_type": "windows",
-        "proxy": {
-            "type": "HTTP",
-            "host": sanitize_proxy_field(proxy_ip),
-            "port": proxy_port,
-            "username": sanitize_proxy_field(network.get('proxy_user', '')),
-            "password": sanitize_proxy_field(network.get('proxy_pass', ''))
-        },
         "parameters": {
+            # Proxy Configuration
+            "proxy": {
+                "host": proxy_ip,
+                "port": proxy_port,
+                "type": "http",
+                "username": proxy_user,
+                "password": proxy_pass
+            },
+            # Full Fingerprint Masking Flags
             "flags": {
-                "audio_masking":  "mask",
-                "canvas_masking": "noise",
-                "webgl_masking":  "noise",
-                "webrtc_masking": "mask"
+                # Proxy & Location - Auto-match to proxy IP
+                "proxy_masking": "custom",
+                "timezone_masking": "mask",          # Auto-detect timezone from proxy
+                "geolocation_masking": "mask",       # Match geolocation to proxy
+                "geolocation_popup": "prompt",       # Ask before sharing location
+                "localization_masking": "mask",      # Language matches proxy country
+                
+                # Browser Identity
+                "navigator_masking": "mask",         # Randomize navigator properties
+                "webrtc_masking": "mask",            # Prevent WebRTC IP leak
+                
+                # Hardware Fingerprinting
+                "screen_masking": "natural",         # Natural screen resolution
+                "graphics_masking": "mask",          # Mask WebGL vendor/renderer
+                "graphics_noise": "natural",         # Natural canvas/WebGL noise
+                "audio_masking": "mask",             # Mask AudioContext fingerprint
+                "media_devices_masking": "natural",  # Natural media devices
+                
+                # Other Protections
+                "fonts_masking": "mask",             # Mask installed fonts
+                "ports_masking": "mask",             # Mask port scan protection
+                
+                # Behavior
+"startup_behavior": "recover"            },
+            # Storage Settings
+            "storage": {
+                "is_local": False,                   # Use cloud storage
+                "save_service_worker": True          # Save service workers for sessions
             }
         }
     }
 
     data = curl_post(f"{MLX_CLOUD_API}/profile/create", payload, token=token)
+    
     if not data:
         return None
 
-    # ✅ FIXED: MLX returns {"data": {"ids": ["uuid"]}} — extract from ids list
+    print(f"   API Response: {data.get('status', {}).get('message', 'OK')}")
+
     inner_data = data.get("data", {})
     ids = inner_data.get("ids", [])
     if ids:
         return ids[0]
 
-    # Fallback for older API response shapes
     return inner_data.get("id") or inner_data.get("uuid")
 
 
@@ -219,9 +244,9 @@ async def main():
         else:
             print(f"   ❌ FAILED: {persona['profile_id']}")
 
-        await asyncio.sleep(2)  # Prevent API rate limit triggers
+        await asyncio.sleep(2)
 
-    print(f"\n🏁 Finished! ✅ {success_count} Created.")
+    print(f"\n🏁 Finished! ✅ {success_count} profiles created with enhanced fingerprinting.")
 
 
 if __name__ == "__main__":

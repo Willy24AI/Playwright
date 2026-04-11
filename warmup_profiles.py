@@ -13,6 +13,7 @@ Requirements:
 - MLX desktop app must be running and connected
 - Supabase credentials in .env file
 - Playwright installed
+- pip install truststore
 """
 
 import os
@@ -24,6 +25,11 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Fix SSL: Use Windows native certificate store instead of Python's bundled OpenSSL.
+# This resolves SSLV3_ALERT_BAD_RECORD_MAC errors when Multilogin X desktop app is running.
+import truststore
+truststore.inject_into_ssl()
 
 import httpx
 from supabase import create_client
@@ -41,8 +47,11 @@ MLX_FOLDER_ID = os.environ.get("MLX_FOLDER_ID")
 MLX_LAUNCHER = "https://launcher.mlx.yt:45001/api/v2"
 
 # Performance Settings
-MAX_CONCURRENT_BROWSERS = 5      # How many browsers at once
+MAX_CONCURRENT_BROWSERS = 5      # Your i7+32GB handles this fine
 TOKEN_REFRESH_INTERVAL = 900     # Refresh token every 15 minutes
+PROXY_WARMUP_DELAY = 5           # Seconds to wait for proxy to initialize
+NAVIGATION_RETRIES = 3           # Retry count for proxy auth errors
+COOKIE_SYNC_COOLDOWN = 5         # Seconds to wait after stopping profile for MLX to sync cookies
 
 if not all([SUPABASE_URL, SUPABASE_KEY, MLX_EMAIL, MLX_PASSWORD, MLX_FOLDER_ID]):
     raise ValueError("Missing credentials in .env")
@@ -261,13 +270,13 @@ async def simulate_scrolling(page):
             return
         
         current = 0
-        for _ in range(random.randint(3, 7)):
+        for _ in range(random.randint(2, 4)):
             scroll = random.randint(200, 500)
             await page.mouse.wheel(0, scroll)
             current += scroll
             
             # Pause to "read"
-            await asyncio.sleep(random.uniform(1.0, 3.0))
+            await asyncio.sleep(random.uniform(0.5, 1.5))
             
             # Sometimes scroll back
             if random.random() < 0.2:
@@ -292,9 +301,9 @@ async def simulate_mouse(page):
         pass
 
 async def maybe_click_link(page):
-    """30% chance to click a link and explore."""
+    """15% chance to click a link and explore."""
     try:
-        if random.random() > 0.3:
+        if random.random() > 0.15:
             return
         
         links = await page.query_selector_all("a[href^='http']:not([href*='javascript'])")
@@ -321,10 +330,35 @@ async def maybe_click_link(page):
     except:
         pass
 
+async def navigate_with_retry(page, url, max_retries=NAVIGATION_RETRIES):
+    """Navigate to a URL with retries for proxy auth errors."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            return True
+        except Exception as e:
+            error_msg = str(e)
+            if "ERR_INVALID_AUTH_CREDENTIALS" in error_msg:
+                if attempt < max_retries:
+                    wait_time = attempt * 3
+                    print(f"      ⚠️ Proxy auth error (attempt {attempt}/{max_retries}), waiting {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"      ❌ Proxy auth failed after {max_retries} attempts")
+                    return False
+            elif "ERR_PROXY_CONNECTION_FAILED" in error_msg or "ERR_TUNNEL_CONNECTION_FAILED" in error_msg:
+                print(f"      ❌ Proxy connection failed")
+                return False
+            else:
+                raise
+    return False
+
 async def google_search(page, query):
     """Perform a Google search."""
     try:
-        await page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
+        nav_ok = await navigate_with_retry(page, "https://www.google.com")
+        if not nav_ok:
+            return False
         await random_delay(1, 2)
         
         search_box = await page.query_selector('textarea[name="q"], input[name="q"]')
@@ -408,7 +442,7 @@ async def warmup_routine(page, profile_data, mla_uuid):
     first = activities[0]
     rest = activities[1:]
     random.shuffle(rest)
-    activities = [first] + rest[:8]  # Max 9 activities
+    activities = [first] + rest[:3]  # Max 4 activities (Google + YouTube + search + niche = enough for cookies)
     
     print(f"[{mla_uuid[:8]}] 📋 {len(activities)} activities planned\n")
     
@@ -420,13 +454,14 @@ async def warmup_routine(page, profile_data, mla_uuid):
                 await google_search(page, target)
             else:
                 print(f"  [{i+1}/{len(activities)}] 🌐 {target}")
-                await page.goto(target, wait_until="domcontentloaded", timeout=30000)
-                await random_delay(1.5, 2.5)
-                await simulate_mouse(page)
-                await simulate_scrolling(page)
-                await maybe_click_link(page)
+                nav_ok = await navigate_with_retry(page, target)
+                if nav_ok:
+                    await random_delay(1.5, 2.5)
+                    await simulate_mouse(page)
+                    await simulate_scrolling(page)
+                    await maybe_click_link(page)
             
-            await asyncio.sleep(random.uniform(2, 4) * dwell)
+            await asyncio.sleep(random.uniform(1, 3) * dwell)
             
         except Exception as e:
             print(f"  ⚠️ {str(e)[:40]}")
@@ -455,6 +490,7 @@ async def process_profile(profile_data, worker_id):
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     
     browser = None
+    final_status = "error"
     
     try:
         print(f"\n{'='*50}")
@@ -465,8 +501,17 @@ async def process_profile(profile_data, worker_id):
             resp = await client.get(start_url, headers=headers)
         
         if resp.status_code != 200:
-            print(f"[{name}] ❌ Start failed: {resp.text[:80]}")
-            supabase.table('profiles').update({'status': 'error'}).eq('id', db_id).execute()
+            error_text = resp.text[:120]
+            if "GET_DIRECT_CONNECTION_IP_ERROR" in error_text:
+                print(f"[{name}] ⚠️ Proxy not available - skipping")
+                final_status = "proxy_error"
+            else:
+                print(f"[{name}] ❌ Start failed: {error_text}")
+                final_status = "error"
+            supabase.table('profiles').update({
+                'status': final_status,
+                'last_used_at': datetime.now(timezone.utc).isoformat()
+            }).eq('id', db_id).execute()
             return
         
         port = resp.json().get("data", {}).get("port")
@@ -477,6 +522,10 @@ async def process_profile(profile_data, worker_id):
         
         print(f"[{name}] 🚀 Port {port}")
         
+        # Wait for proxy to fully initialize before connecting
+        print(f"[{name}] ⏳ Waiting {PROXY_WARMUP_DELAY}s for proxy to initialize...")
+        await asyncio.sleep(PROXY_WARMUP_DELAY)
+        
         async with async_playwright() as p:
             browser = await p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
             context = browser.contexts[0]
@@ -485,41 +534,57 @@ async def process_profile(profile_data, worker_id):
             
             await warmup_routine(page, profile_data, mla_uuid)
             
-            supabase.table('profiles').update({
-                'status': 'available',
-                'last_used_at': datetime.now(timezone.utc).isoformat()
-            }).eq('id', db_id).execute()
-            
+            final_status = "available"
             await browser.close()
             browser = None
     
     except Exception as e:
         print(f"[{name}] ❌ {str(e)[:80]}")
-        supabase.table('profiles').update({'status': 'error'}).eq('id', db_id).execute()
+        final_status = "error"
     
     finally:
         if browser:
             try: await browser.close()
             except: pass
         
+        # Stop profile
         try:
             async with httpx.AsyncClient(verify=False, timeout=15) as client:
                 await client.get(stop_url, headers=headers)
-            print(f"[{name}] 🛑 Stopped\n")
+            print(f"[{name}] 🛑 Stopped, status: {final_status}")
         except:
             pass
+        
+        # Wait for MLX to sync cookies to cloud before starting next profile
+        print(f"[{name}] ⏳ Waiting {COOKIE_SYNC_COOLDOWN}s for cookie sync...")
+        await asyncio.sleep(COOKIE_SYNC_COOLDOWN)
+        
+        # Update database
+        supabase.table('profiles').update({
+            'status': final_status,
+            'last_used_at': datetime.now(timezone.utc).isoformat()
+        }).eq('id', db_id).execute()
 
 # ==========================================
 # ATOMIC LOCK
 # ==========================================
 async def get_and_lock_profile():
     try:
-        resp = supabase.table('profiles').select('*').eq('status', 'available').limit(1).execute()
+        resp = supabase.table('profiles')\
+            .select('*')\
+            .eq('status', 'available')\
+            .not_.is_('mla_uuid', 'null')\
+            .limit(1)\
+            .execute()
         if not resp.data:
             return None
         
         profile = resp.data[0]
-        update = supabase.table('profiles').update({'status': 'in_use'}).eq('id', profile['id']).eq('status', 'available').execute()
+        update = supabase.table('profiles')\
+            .update({'status': 'in_use'})\
+            .eq('id', profile['id'])\
+            .eq('status', 'available')\
+            .execute()
         
         if update.data and len(update.data) > 0:
             return profile
@@ -537,14 +602,19 @@ async def worker(worker_id, semaphore):
             
             if not profile:
                 await asyncio.sleep(1)
-                check = supabase.table('profiles').select('id').eq('status', 'available').limit(1).execute()
+                check = supabase.table('profiles')\
+                    .select('id')\
+                    .eq('status', 'available')\
+                    .not_.is_('mla_uuid', 'null')\
+                    .limit(1)\
+                    .execute()
                 if not check.data:
                     print(f"[Worker {worker_id}] ✅ Done")
                     break
                 continue
             
             await process_profile(profile, worker_id)
-            await asyncio.sleep(2)
+            await asyncio.sleep(random.uniform(2, 5))
 
 # ==========================================
 # MAIN
@@ -559,6 +629,8 @@ async def main():
     print("✓ Location-based searches")
     print("✓ Interest-based niche sites")
     print("✓ Human-like behavior")
+    print(f"✓ Proxy warmup: {PROXY_WARMUP_DELAY}s delay")
+    print(f"✓ Navigation retries: {NAVIGATION_RETRIES}")
     print(f"✓ Max {MAX_CONCURRENT_BROWSERS} browsers")
     print("="*50 + "\n")
     
@@ -569,7 +641,11 @@ async def main():
         print(f"❌ Auth failed: {e}")
         return
     
-    count = supabase.table('profiles').select('id', count='exact').eq('status', 'available').execute()
+    count = supabase.table('profiles')\
+        .select('id', count='exact')\
+        .eq('status', 'available')\
+        .not_.is_('mla_uuid', 'null')\
+        .execute()
     total = count.count if hasattr(count, 'count') else len(count.data)
     print(f"📊 {total} profiles to warm up\n")
     
@@ -586,7 +662,7 @@ async def main():
     print("="*50)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n🛑 Stopped")
+    # NOTE: Do NOT use WindowsSelectorEventLoopPolicy — it breaks Playwright's
+    # connect_over_cdp() on Windows because SelectorEventLoop doesn't support
+    # subprocess_exec. The default ProactorEventLoop works for both httpx and Playwright.
+    asyncio.run(main())

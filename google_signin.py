@@ -669,7 +669,7 @@ async def main():
     # ==========================================
     # TEST MODE: Limit to 10 profiles
     # ==========================================
-    TEST_LIMIT = 10  # Set to None for all profiles
+    TEST_LIMIT = None  # Set to None for all profiles
     
     # Count profiles
     count = supabase.table('profiles')\

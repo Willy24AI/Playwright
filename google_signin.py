@@ -13,6 +13,7 @@ Requirements:
 - Multilogin X desktop app running and connected
 - Profiles created with mla_uuid
 - google_email, google_password, google_recovery in Supabase
+- pip install truststore
 """
 
 import os
@@ -25,6 +26,11 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Fix SSL: Use Windows native certificate store instead of Python's bundled OpenSSL.
+# This resolves SSLV3_ALERT_BAD_RECORD_MAC errors when Multilogin X desktop app is running.
+import truststore
+truststore.inject_into_ssl()
 
 import httpx
 from supabase import create_client
@@ -47,6 +53,8 @@ MLX_LAUNCHER = "https://launcher.mlx.yt:45001/api/v2"
 MAX_CONCURRENT = 3               # Keep low for Google login
 TOKEN_REFRESH_INTERVAL = 900     # 15 minutes
 CAPTCHA_TIMEOUT = 120            # Seconds to wait for manual CAPTCHA solve
+PROXY_WARMUP_DELAY = 5           # Seconds to wait for proxy to initialize after browser launch
+NAVIGATION_RETRIES = 3           # Retry count for ERR_INVALID_AUTH_CREDENTIALS
 
 if not all([SUPABASE_URL, SUPABASE_KEY, MLX_EMAIL, MLX_PASSWORD, MLX_FOLDER_ID]):
     raise ValueError("Missing credentials in .env")
@@ -156,21 +164,73 @@ async def quick_post_login_warmup(page):
     
     print("   ✓ Warmup complete")
 
+async def navigate_with_retry(page, url, profile_name, max_retries=NAVIGATION_RETRIES):
+    """Navigate to a URL with retries for proxy auth errors."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            return True
+        except Exception as e:
+            error_msg = str(e)
+            if "ERR_INVALID_AUTH_CREDENTIALS" in error_msg:
+                if attempt < max_retries:
+                    wait_time = attempt * 3  # 3s, 6s, 9s
+                    print(f"   ⚠️ Proxy auth error (attempt {attempt}/{max_retries}), waiting {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"   ❌ Proxy auth failed after {max_retries} attempts")
+                    return False
+            elif "ERR_PROXY_CONNECTION_FAILED" in error_msg or "ERR_TUNNEL_CONNECTION_FAILED" in error_msg:
+                print(f"   ❌ Proxy connection failed completely")
+                return False
+            else:
+                raise  # Re-raise non-proxy errors
+    return False
+
+async def click_next_button(page):
+    """Click the Next button on Google sign-in pages using multiple strategies."""
+    # Strategy 1: Click button with text "Next"
+    try:
+        next_btn = page.get_by_role("button", name="Next")
+        if await next_btn.count() > 0 and await next_btn.first.is_visible():
+            await next_btn.first.click()
+            return True
+    except:
+        pass
+    
+    # Strategy 2: Click by ID (Google's identifierNext / passwordNext)
+    for btn_id in ["identifierNext", "passwordNext"]:
+        try:
+            btn = page.locator(f"#{btn_id}")
+            if await btn.count() > 0 and await btn.first.is_visible():
+                await btn.first.click()
+                return True
+        except:
+            pass
+    
+    # Strategy 3: Press Enter as fallback
+    await page.keyboard.press("Enter")
+    return True
+
 # ==========================================
 # GOOGLE LOGIN LOGIC
 # ==========================================
-async def login_to_google(page, email: str, password: str, recovery: str) -> str:
+async def login_to_google(page, email: str, password: str, recovery: str, profile_name: str) -> str:
     """
     Perform Google login with human-like behavior.
     
-    Returns status: "logged_in", "pva_locked", "captcha_locked", "error"
+    Returns status: "logged_in", "pva_locked", "captcha_locked", "proxy_error", "error"
     """
     
     # ==========================================
     # ZONE 1: Email Entry
     # ==========================================
     print("   → Navigating to Google Sign-In...")
-    await page.goto("https://accounts.google.com/signin", wait_until="domcontentloaded", timeout=30000)
+    
+    nav_ok = await navigate_with_retry(page, "https://accounts.google.com/signin", profile_name)
+    if not nav_ok:
+        return "proxy_error"
+    
     await random_delay(1, 2)
     
     # Check if already logged in
@@ -192,56 +252,121 @@ async def login_to_google(page, email: str, password: str, recovery: str) -> str
     if email_input:
         print("   → Entering email...")
         await human_type(email_input, email)
-        await page.keyboard.press("Enter")
-        await page.wait_for_load_state("networkidle", timeout=15000)
+        await random_delay(0.5, 1.0)
+        
+        # Click Next button (more reliable than just pressing Enter)
+        await click_next_button(page)
+        
+        # Wait for the page to leave the email screen.
+        # Instead of networkidle (unreliable), wait for password field OR error/challenge.
+        print("   → Waiting for password screen...")
+        password_appeared = False
+        for wait_attempt in range(3):
+            try:
+                # Wait for password field to appear (Google animates this transition)
+                await page.wait_for_selector('input[type="password"]', state="visible", timeout=15000)
+                password_appeared = True
+                break
+            except:
+                # Check if something else happened instead of password screen
+                current_url = page.url
+                
+                # Already logged in?
+                if "myaccount.google.com" in current_url:
+                    print("   ✓ Already logged in!")
+                    return "logged_in"
+                
+                # Security challenge?
+                if "challenge" in current_url or "speedbump" in current_url:
+                    print("   ⚠️ Challenge detected after email")
+                    break
+                
+                # Check for CAPTCHA
+                page_content = await page.content()
+                has_captcha = any(marker in page_content.lower() for marker in [
+                    "recaptcha", "captcha-form", "g-recaptcha", "rc-anchor",
+                    "solve this puzzle", "verify you are a human"
+                ])
+                if has_captcha:
+                    print(f"   ⚠️ CAPTCHA Detected! You have {CAPTCHA_TIMEOUT}s to solve it manually...")
+                    try:
+                        await page.wait_for_selector('input[type="password"]', timeout=CAPTCHA_TIMEOUT * 1000)
+                        password_appeared = True
+                    except:
+                        print("   ❌ CAPTCHA timeout")
+                        return "captcha_locked"
+                    break
+                
+                # Check if email was rejected
+                try:
+                    error_el = page.locator("text=Couldn't find your Google Account")
+                    if await error_el.count() > 0 and await error_el.first.is_visible():
+                        print("   ❌ Google Account not found")
+                        return "error"
+                except:
+                    pass
+                
+                # Still on identifier page - maybe Next didn't register, try again
+                if "identifier" in current_url and wait_attempt < 2:
+                    print(f"   ⚠️ Still on email page, retrying Next click (attempt {wait_attempt + 2}/3)...")
+                    await click_next_button(page)
+                    await random_delay(1, 2)
+                    continue
+                
+                # Give up
+                if "identifier" in current_url:
+                    print("   ❌ Stuck on email page after 3 attempts")
+                    return "error"
+                
+                print(f"   ⚠️ Unexpected state after email, URL: {current_url[:60]}")
+                break
     else:
         print("   ⚠️ Could not find email input")
         return "error"
     
-    await random_delay(2, 3)
+    await random_delay(1, 2)
     
-    # Check for CAPTCHA
-    page_content = await page.content()
-    if "captcha" in page_content.lower() or "/v2/identifier" in page.url:
-        print(f"   ⚠️ CAPTCHA Detected! You have {CAPTCHA_TIMEOUT}s to solve it manually...")
+    # Handle Passkey/Phone intercept (may appear before password)
+    if not password_appeared:
+        await handle_try_another_way(page)
+        
+        # Click "Enter your password" if shown
         try:
-            await page.wait_for_selector('input[type="password"]', timeout=CAPTCHA_TIMEOUT * 1000)
-            print("   ✓ CAPTCHA solved!")
+            pwd_option = page.locator("text='Enter your password'")
+            if await pwd_option.count() > 0:
+                await pwd_option.first.click()
+                await page.wait_for_load_state("networkidle", timeout=10000)
         except:
-            print("   ❌ CAPTCHA timeout")
-            return "captcha_locked"
-    
-    # Handle Passkey/Phone intercept
-    await handle_try_another_way(page)
-    
-    # Click "Enter your password" if shown
-    try:
-        pwd_option = page.locator("text='Enter your password'")
-        if await pwd_option.count() > 0:
-            await pwd_option.first.click()
-            await page.wait_for_load_state("networkidle", timeout=10000)
-    except:
-        pass
+            pass
+        
+        # One more try for password field
+        try:
+            await page.wait_for_selector('input[type="password"]', state="visible", timeout=10000)
+            password_appeared = True
+        except:
+            if "challenge" in page.url or "speedbump" in page.url:
+                print("   ❌ Security challenge before password")
+                return "pva_locked"
+            print("   ❌ Password field not found")
+            return "error"
     
     # ==========================================
     # ZONE 2: Password Entry
     # ==========================================
-    try:
-        await page.wait_for_selector('input[type="password"]', state="visible", timeout=10000)
-    except:
-        # Check if we hit a challenge early
-        if "challenge" in page.url or "speedbump" in page.url:
-            print("   ❌ Security challenge before password")
-            return "pva_locked"
-        print("   ❌ Password field not found")
-        return "error"
     
     password_input = await page.query_selector('input[type="password"]')
     if password_input:
         print("   → Entering password...")
         await human_type(password_input, password)
-        await page.keyboard.press("Enter")
-        await page.wait_for_load_state("networkidle", timeout=15000)
+        await random_delay(0.5, 1.0)
+        
+        # Click Next button
+        await click_next_button(page)
+        
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except:
+            pass
     else:
         return "error"
     
@@ -347,8 +472,17 @@ async def process_profile(profile_data, worker_id):
             resp = await client.get(start_url, headers=headers)
         
         if resp.status_code != 200:
-            print(f"[{profile_name}] ❌ Failed to start: {resp.text[:80]}")
-            supabase.table('profiles').update({'status': 'error'}).eq('id', db_id).execute()
+            error_text = resp.text[:120]
+            if "GET_DIRECT_CONNECTION_IP_ERROR" in error_text:
+                print(f"[{profile_name}] ⚠️ Proxy not available - skipping")
+                final_status = "proxy_error"
+            else:
+                print(f"[{profile_name}] ❌ Failed to start: {error_text}")
+                final_status = "error"
+            supabase.table('profiles').update({
+                'status': final_status,
+                'last_used_at': datetime.now(timezone.utc).isoformat()
+            }).eq('id', db_id).execute()
             return
         
         port = resp.json().get("data", {}).get("port")
@@ -359,6 +493,10 @@ async def process_profile(profile_data, worker_id):
         
         print(f"[{profile_name}] 🚀 Browser started on port {port}")
         
+        # Wait for proxy to fully initialize before connecting
+        print(f"[{profile_name}] ⏳ Waiting {PROXY_WARMUP_DELAY}s for proxy to initialize...")
+        await asyncio.sleep(PROXY_WARMUP_DELAY)
+        
         # Connect Playwright
         async with async_playwright() as p:
             browser = await p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
@@ -368,7 +506,7 @@ async def process_profile(profile_data, worker_id):
             page = context.pages[0] if context.pages else await context.new_page()
             
             # Perform login
-            login_result = await login_to_google(page, email, password, recovery)
+            login_result = await login_to_google(page, email, password, recovery, profile_name)
             
             if login_result == "logged_in":
                 # Do quick warmup after successful login
@@ -378,6 +516,8 @@ async def process_profile(profile_data, worker_id):
                 final_status = "pva_locked"
             elif login_result == "captcha_locked":
                 final_status = "captcha_locked"
+            elif login_result == "proxy_error":
+                final_status = "proxy_error"
             else:
                 final_status = "error"
             
@@ -419,7 +559,6 @@ async def get_and_lock_profile(remaining_count):
         
     try:
         # Get profiles that need login (available but not yet logged in)
-        # You might want to add a 'needs_login' flag or check some other criteria
         response = supabase.table('profiles')\
             .select('*')\
             .eq('status', 'available')\
@@ -514,6 +653,8 @@ async def main():
     print(f"✓ Human-like typing & behavior")
     print(f"✓ Challenge handling (recovery email)")
     print(f"✓ Post-login warmup")
+    print(f"✓ Proxy warmup: {PROXY_WARMUP_DELAY}s delay")
+    print(f"✓ Navigation retries: {NAVIGATION_RETRIES}")
     print(f"✓ Max {MAX_CONCURRENT} concurrent browsers")
     print("="*50 + "\n")
     
@@ -555,6 +696,7 @@ async def main():
     print("="*50)
 
 if __name__ == "__main__":
-    if os.name == 'nt':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # NOTE: Do NOT use WindowsSelectorEventLoopPolicy — it breaks Playwright's
+    # connect_over_cdp() on Windows because SelectorEventLoop doesn't support
+    # subprocess_exec. The default ProactorEventLoop works for both httpx and Playwright.
     asyncio.run(main())

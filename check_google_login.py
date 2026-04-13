@@ -151,21 +151,41 @@ async def check_profile(profile_data, worker_id):
     
     try:
         # Start profile
-        async with httpx.AsyncClient(verify=False, trust_env=False, timeout=60) as client:
-            resp = await client.get(start_url, headers=headers)
+        try:
+            async with httpx.AsyncClient(verify=False, trust_env=False, timeout=60) as client:
+                resp = await client.get(start_url, headers=headers)
+        except Exception as e:
+            print(f"  [{profile_name}] ⚠️ Network error starting profile: {str(e)[:50]}")
+            async with counter_lock:
+                error_count += 1
+            return
         
         if resp.status_code != 200:
-            error_text = resp.text[:80]
+            error_text = resp.text[:120]
             if "GET_DIRECT_CONNECTION_IP_ERROR" in error_text:
-                print(f"  [{profile_name}] ⚠️ Proxy error - skipping")
+                print(f"  [{profile_name}] ⚠️ Proxy error - marking as proxy_error")
+            elif "PROFILE_ALREADY_RUNNING" in error_text:
+                print(f"  [{profile_name}] ⚠️ Already running - skipping")
+                async with counter_lock:
+                    error_count += 1
+                return  # Don't mark as proxy_error, just skip
             else:
-                print(f"  [{profile_name}] ❌ Start failed")
+                print(f"  [{profile_name}] ❌ Start failed - marking as proxy_error")
+            
+            # Mark as proxy_error so it won't be retried
+            supabase.table('profiles').update({
+                'status': 'proxy_error'
+            }).eq('id', db_id).execute()
+            
             async with counter_lock:
                 error_count += 1
             return
         
         port = resp.json().get("data", {}).get("port")
         if not port:
+            supabase.table('profiles').update({
+                'status': 'proxy_error'
+            }).eq('id', db_id).execute()
             async with counter_lock:
                 error_count += 1
             return
@@ -180,25 +200,27 @@ async def check_profile(profile_data, worker_id):
             context.set_default_timeout(15000)
             page = context.pages[0] if context.pages else await context.new_page()
             
-            # Navigate to Google My Account - this is the fastest check
+            # Navigate to YouTube - check if signed in
             try:
-                await page.goto("https://myaccount.google.com", wait_until="domcontentloaded", timeout=20000)
-                await asyncio.sleep(2)
+                await page.goto("https://www.youtube.com", wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(3)
                 
-                current_url = page.url
                 page_content = await page.content()
                 
-                # Check if we're on the account page (logged in) or redirected to sign-in
-                if "myaccount.google.com" in current_url and "signin" not in current_url:
-                    # Extra check: look for account-related elements
+                # If signed in: YouTube shows avatar button (id="avatar-btn") or account menu
+                # If not signed in: YouTube shows "Sign in" button
+                has_sign_in_button = await page.locator("a[href*='accounts.google.com/ServiceLogin'], tp-yt-paper-button#sign-in-button, a:text('Sign in')").count()
+                has_avatar = await page.locator("#avatar-btn, button#avatar-btn, img#img[alt*='Avatar']").count()
+                
+                if has_avatar > 0 and has_sign_in_button == 0:
                     is_logged_in = True
-                elif "accounts.google.com/signin" in current_url or "accounts.google.com/v3/signin" in current_url:
-                    is_logged_in = False
-                elif "accounts.google.com" in current_url and "identifier" in current_url:
+                elif has_sign_in_button > 0:
                     is_logged_in = False
                 else:
-                    # Check page content for signs of being logged in
-                    if "Personal info" in page_content or "Security" in page_content or "Google Account" in page_content:
+                    # Fallback: check page content
+                    if "Sign in" in page_content and "avatar-btn" not in page_content:
+                        is_logged_in = False
+                    elif "avatar-btn" in page_content:
                         is_logged_in = True
                     else:
                         is_logged_in = False
@@ -206,9 +228,23 @@ async def check_profile(profile_data, worker_id):
             except Exception as e:
                 error_msg = str(e)
                 if "ERR_INVALID_AUTH_CREDENTIALS" in error_msg or "ERR_PROXY" in error_msg:
-                    print(f"  [{profile_name}] ⚠️ Proxy error")
+                    print(f"  [{profile_name}] ⚠️ Proxy error - marking as proxy_error")
+                    supabase.table('profiles').update({
+                        'status': 'proxy_error'
+                    }).eq('id', db_id).execute()
                     async with counter_lock:
                         error_count += 1
+                    # Stop profile before returning
+                    try:
+                        async with httpx.AsyncClient(verify=False, timeout=15) as client:
+                            await client.get(stop_url, headers=headers)
+                    except:
+                        pass
+                    try:
+                        await browser.close()
+                    except:
+                        pass
+                    browser = None
                     return
                 is_logged_in = False
             
@@ -404,16 +440,21 @@ async def main():
     tasks = [asyncio.create_task(worker(i, semaphore, total)) for i in range(MAX_CONCURRENT)]
     await asyncio.gather(*tasks, return_exceptions=True)
     
-    # Final summary
+    # Final summary - get actual counts from DB
+    final_counts = {}
+    for status in ['google_logged_in', 'available', 'proxy_error', 'checking']:
+        r = supabase.table('profiles').select('id', count='exact').eq('status', status).execute()
+        final_counts[status] = r.count if hasattr(r, 'count') and r.count is not None else len(r.data)
+    
     print("\n" + "="*50)
     print("🏁 CHECK COMPLETE!")
-    print(f"  ✅ Logged in:     {logged_in_count}")
-    print(f"  ❌ Not logged in: {not_logged_in_count}")
-    print(f"  ⚠️  Errors:       {error_count}")
+    print(f"  ✅ Logged in:      {final_counts.get('google_logged_in', 0)}")
+    print(f"  ❌ Not logged in:  {final_counts.get('available', 0)}")
+    print(f"  ⚠️  Proxy errors:  {final_counts.get('proxy_error', 0)}")
     print("="*50)
     
-    if not_logged_in_count > 0:
-        print(f"\n👉 {not_logged_in_count} profiles still need manual Google login in MLX.")
+    if final_counts.get('available', 0) > 0:
+        print(f"\n👉 {final_counts['available']} profiles still need manual Google login in MLX.")
         print("   Log in manually, then run this script again to update.")
 
 if __name__ == "__main__":

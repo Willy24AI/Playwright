@@ -9,6 +9,12 @@ Complete production-ready brain for browser warming and targeted strikes.
 - Playwright CDP Retry Matrix
 - Database Bloat Protection (Free-Tier Safe)
 - Viral Velocity Pacing (Beta Distribution S-Curve for Strikes)
+
+[FIXED]:
+- truststore SSL fix for Multilogin X desktop app compatibility
+- Cookie save order: MLX stop BEFORE Playwright close
+- Proxy error handling (skip dead proxies gracefully)
+- No WindowsSelectorEventLoopPolicy (breaks Playwright on Windows)
 """
 
 import asyncio
@@ -22,6 +28,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+# Fix SSL: Use Windows native certificate store
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
 
 # Custom Modules
 from auth import get_token
@@ -174,14 +187,24 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         update_profile_status(pid, status="FAILED", error_msg="Missing MLX profile_id")
         return
 
+    # --- LAUNCH PROFILE ---
     try:
         loop = asyncio.get_running_loop()
         ws_url = await loop.run_in_executor(None, start_profile, profile_id, token)
+    except ConnectionError as e:
+        if "PROXY_ERROR" in str(e):
+            plog(pid, f"⚠️ Proxy dead — skipping profile")
+            update_profile_status(pid, status="PROXY_ERROR", error_msg=str(e))
+            return
+        plog(pid, f"❌ MLX Launch Fail: {e}")
+        update_profile_status(pid, status="FAILED", error_msg=f"MLX Error: {str(e)}")
+        return
     except Exception as e:
         plog(pid, f"❌ MLX Launch Fail: {e}")
         update_profile_status(pid, status="FAILED", error_msg=f"MLX Error: {str(e)}")
         return
 
+    # --- CONNECT PLAYWRIGHT ---
     async with async_playwright() as p:
         browser = None
         for attempt in range(3):
@@ -207,6 +230,7 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         vp = browser_cfg.get("viewport", {"width": 1920, "height": 1080})
         await page.set_viewport_size({"width": vp["width"] + random.randint(-4, 4), "height": vp["height"] + random.randint(-4, 4)})
 
+        # --- BUILD SESSION LIST ---
         sessions = []
         if strike_keyword and strike_channel:
             sessions.append("youtube_strike")
@@ -228,13 +252,13 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
 
         random.shuffle(sessions) 
 
+        # --- EXECUTE SESSIONS ---
         for session_type in sessions:
             plog(pid, f"⚡ Active Task: {session_type.upper()}")
             
             try:
                 if session_type == "google": await google_session(page, profile)
                 elif session_type == "youtube": await youtube_warm_session(page, profile, behavior, warm_day=warm_day)
-                # 🛡️ MATURATION UPGRADE: Passed warm_day into the strike function
                 elif session_type == "youtube_strike": await execute_target_strike(page, profile, strike_keyword, strike_channel, warm_day=warm_day)
                 elif session_type == "wander": await wander_session(page, profile) 
                 elif session_type == "newsletter": await subscribe_to_newsletter(page, profile)
@@ -249,12 +273,14 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
 
                 completed_tasks.append(session_type)
                 
-                # 🛡️ DB BLOAT FIX: Removed intermediate updates to keep Supabase Free-Tier safe.
-                # update_profile_status(pid, status="RUNNING", tasks=completed_tasks)
-                
             except PlaywrightTimeoutError:
                 plog(pid, f"⚠️ Task '{session_type}' timed out. Skipping to next module.")
             except Exception as e:
+                error_msg = str(e)
+                # If proxy died mid-session, stop everything for this profile
+                if "ERR_INVALID_AUTH_CREDENTIALS" in error_msg or "ERR_PROXY_CONNECTION_FAILED" in error_msg:
+                    plog(pid, f"❌ Proxy died during '{session_type}'. Aborting remaining tasks.")
+                    break
                 plog(pid, f"⚠️ Task '{session_type}' encountered an error: {e}. Skipping.")
 
             if len(sessions) > 1 and session_type != sessions[-1]:
@@ -262,17 +288,30 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
                 plog(pid, f"⏸ Task Transition: {pause:.0f}s break...")
                 await asyncio.sleep(pause)
 
-        plog(pid, "✅ Daily routine completed. Flushing cookies...")
+        # --- SHUTDOWN: CORRECT ORDER ---
+        # IMPORTANT: Stop MLX profile FIRST to save cookies, THEN close Playwright
+        plog(pid, "✅ Daily routine completed. Saving cookies...")
         update_profile_status(pid, status="SUCCESS", tasks=completed_tasks)
         
+        # 1. Stop MLX profile (saves cookies to cloud)
+        await loop.run_in_executor(None, stop_profile, profile_id, token)
+        plog(pid, "💾 Cookies saved to cloud.")
+        
+        # 2. Brief pause for cookie sync
+        await asyncio.sleep(3)
+        
+        # 3. Now close Playwright (browser is already closed by MLX stop)
         try:
             await page.close()
+        except Exception: pass
+        try:
             await context.close()
+        except Exception: pass
+        try:
             await browser.close()
         except Exception: pass
         
-        await loop.run_in_executor(None, stop_profile, profile_id, token)
-        plog(pid, "💾 Profile saved and stopped cleanly.")
+        plog(pid, "🏁 Profile session complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -295,12 +334,10 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
     sem = asyncio.Semaphore(max_concurrent)
 
     async def process_profile(profile):
-        # 📈 VIRAL VELOCITY CURVE: S-Curve Pacing for Strike Missions
-        base_stagger = random.uniform(1.0, 15.0) # Standard MLX port protection
+        # Viral Velocity Curve for Strike Missions
+        base_stagger = random.uniform(1.0, 15.0)
         
         if strike_keyword:
-            # We use a Beta Distribution (alpha=2, beta=4) to simulate an organic viral spike.
-            # Start slow, spike sharply in the middle, and taper off with a long tail.
             window_seconds = strike_window * 3600
             velocity_delay = random.betavariate(2, 4) * window_seconds
             stagger = base_stagger + velocity_delay
@@ -361,8 +398,6 @@ if __name__ == "__main__":
     
     parser.add_argument("--strike-keyword", type=str, default=None, help="Target search phrase for YouTube Strike")
     parser.add_argument("--strike-channel", type=str, default=None, help="Exact channel name for YouTube Strike verification")
-    
-    # NEW: Velocity Window Argument
     parser.add_argument("--strike-window", type=float, default=2.0, help="Hours to organically spread the strike traffic across.")
 
     args = parser.parse_args()
@@ -384,4 +419,5 @@ if __name__ == "__main__":
     elif args.schedule:
         run_scheduler(args.profile, g, y, w, args.day, args.concurrency, args.region, args.strike_keyword, args.strike_channel, args.strike_window)
     else:
+        # NOTE: Do NOT use WindowsSelectorEventLoopPolicy — it breaks Playwright
         asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency, region=args.region, strike_keyword=args.strike_keyword, strike_channel=args.strike_channel, strike_window=args.strike_window))

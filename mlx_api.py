@@ -4,6 +4,11 @@ mlx_api.py
 Starts and stops Multilogin profiles.
 Upgraded with Dynamic CDP Polling to prevent ConnectionRefusedErrors 
 under high-concurrency swarm loads, and safeguards against Zombie Processes.
+
+[FIXED]:
+- truststore SSL fix for Multilogin X desktop app compatibility
+- Proxy warmup delay after port opens
+- Better error categorization (proxy_error vs hard failure)
 """
 
 import logging
@@ -19,6 +24,13 @@ from dotenv import load_dotenv
 # Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Fix SSL: Use Windows native certificate store
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
 ENV_PATH = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
@@ -26,6 +38,7 @@ log = logging.getLogger(__name__)
 
 LOCAL_AGENT = "https://launcher.mlx.yt:45001"
 MAX_BOOT_WAIT = 30  # Maximum seconds to wait for the browser to open the CDP port
+PROXY_WARMUP_DELAY = 3  # Extra seconds after port opens for proxy to fully initialize
 
 def _is_port_open(port: int) -> bool:
     """Silently pings a localhost port to see if the DevTools protocol is ready."""
@@ -41,6 +54,7 @@ def start_profile(profile_id: str, token: str) -> str:
     """
     Starts a Multilogin profile and returns the CDP endpoint URL.
     Dynamically polls the port to ensure Playwright can connect safely.
+    Includes proxy warmup delay after port opens.
     """
     folder_id = os.getenv("MLX_FOLDER_ID", "").strip()
     if not folder_id:
@@ -57,7 +71,7 @@ def start_profile(profile_id: str, token: str) -> str:
         requests.get(stop_url, headers=headers, verify=False, timeout=10)
         time.sleep(2)
     except Exception:
-        pass # If it fails to stop, it likely wasn't running. Proceed to start.
+        pass
 
     start_url = (
         f"{LOCAL_AGENT}/api/v2/profile/f/{folder_id}/p/{profile_id}"
@@ -79,14 +93,21 @@ def start_profile(profile_id: str, token: str) -> str:
                     ws_endpoint = f"http://127.0.0.1:{port}"
                     log.info(f"    ⚙️ [{profile_id[:8]}] MLX returned port {port}. Waiting for DevTools to bind...")
                     
-                    # 2. Dynamic Polling: Wait ONLY as long as necessary for the port to open
+                    # 2. Dynamic Polling: Wait for the port to open
                     start_wait = time.time()
                     while time.time() - start_wait < MAX_BOOT_WAIT:
                         if _is_port_open(int(port)):
                             boot_time = time.time() - start_wait
-                            log.info(f"    ✅ [{profile_id[:8]}] Browser DevTools active after {boot_time:.1f}s. Handing off to Playwright.")
+                            log.info(f"    ✅ [{profile_id[:8]}] Browser DevTools active after {boot_time:.1f}s.")
+                            
+                            # 3. Proxy Warmup: Give the proxy a moment to fully initialize
+                            # This prevents ERR_INVALID_AUTH_CREDENTIALS on first navigation
+                            log.info(f"    ⏳ [{profile_id[:8]}] Proxy warmup ({PROXY_WARMUP_DELAY}s)...")
+                            time.sleep(PROXY_WARMUP_DELAY)
+                            
+                            log.info(f"    🚀 [{profile_id[:8]}] Handing off to Playwright.")
                             return ws_endpoint
-                        time.sleep(1) # Check again in 1 second
+                        time.sleep(1)
                         
                     raise TimeoutError(f"Browser launched, but port {port} never opened.")
 
@@ -106,12 +127,18 @@ def start_profile(profile_id: str, token: str) -> str:
                     log.warning(f"    ⚠️ MLX states profile is already running. Forcing stop and retry... (attempt {attempt+1}/3)")
                     requests.get(stop_url, headers=headers, verify=False, timeout=10)
                     time.sleep(5)
+                elif error_code == "GET_DIRECT_CONNECTION_IP_ERROR":
+                    # Proxy is dead/misconfigured — don't retry, skip this profile
+                    raise ConnectionError(f"PROXY_ERROR: Profile {profile_id[:8]} has a dead proxy")
                 else:
                     log.warning(f"    ⚠️ [{response.status_code}] {response.text} (attempt {attempt+1}/3)")
                     time.sleep(5)
             else:
                 log.warning(f"    ⚠️ [{response.status_code}] {response.text} (attempt {attempt+1}/3)")
                 time.sleep(5)
+
+        except (ConnectionError, PermissionError, TimeoutError):
+            raise  # Don't retry these — they're definitive
 
         except requests.RequestException as e:
             log.warning(f"    ⚠️ MLX Request error (attempt {attempt+1}/3): {e}")
@@ -121,7 +148,10 @@ def start_profile(profile_id: str, token: str) -> str:
 
 
 def stop_profile(profile_id: str, token: str):
-    """Stops a profile cleanly — saves cookies back to Multilogin."""
+    """
+    Stops a profile cleanly — saves cookies back to Multilogin.
+    IMPORTANT: Call this BEFORE browser.close() to ensure cookies are saved.
+    """
     folder_id = os.getenv("MLX_FOLDER_ID", "").strip()
     if not folder_id:
         log.warning("    ⚠️ MLX_FOLDER_ID not set — cannot stop profile cleanly")
@@ -136,7 +166,7 @@ def stop_profile(profile_id: str, token: str):
     try:
         resp = requests.get(url, headers=headers, verify=False, timeout=15)
         if resp.status_code == 200:
-            log.info(f"    ⏹ [{profile_id[:8]}] Profile cleanly stopped. Data synced.")
+            log.info(f"    ⏹ [{profile_id[:8]}] Profile stopped & cookies saved to cloud.")
         elif resp.status_code == 404:
             log.info(f"    ⏹ [{profile_id[:8]}] Profile already stopped.")
         else:

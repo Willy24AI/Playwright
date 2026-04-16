@@ -22,6 +22,7 @@ import argparse
 import logging
 import os
 import random
+import signal
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -77,6 +78,63 @@ PERSONA_ICONS = {
 def plog(profile_id: str, msg: str):
     icon = PERSONA_ICONS.get(profile_id, "👤")
     log.info(f"{icon} [{profile_id[:15]:15s}] {msg}")
+
+# ---------------------------------------------------------------------------
+# GRACEFUL SHUTDOWN SYSTEM
+# ---------------------------------------------------------------------------
+# Tracks all currently running profiles so Ctrl+C can save cookies before exit
+shutdown_requested = False
+running_profiles = {}  # {profile_id: token} — profiles currently in a browser session
+running_profiles_lock = asyncio.Lock() if hasattr(asyncio, 'Lock') else None
+
+def request_shutdown(signum=None, frame=None):
+    """Called on Ctrl+C. Sets flag so workers stop picking up new profiles."""
+    global shutdown_requested
+    if shutdown_requested:
+        # Second Ctrl+C = force kill
+        log.warning("\n⚠️ Force kill! Cookies may not be saved.")
+        os._exit(1)
+    shutdown_requested = True
+    log.warning("\n🛑 SHUTDOWN REQUESTED — Saving cookies for all running profiles...")
+    log.warning("   (Press Ctrl+C again to force quit without saving)")
+
+# Register the signal handler
+signal.signal(signal.SIGINT, request_shutdown)
+
+async def register_running_profile(profile_id: str, token: str):
+    """Track a profile as currently running."""
+    global running_profiles
+    running_profiles[profile_id] = token
+
+async def unregister_running_profile(profile_id: str):
+    """Remove a profile from the running tracker."""
+    global running_profiles
+    running_profiles.pop(profile_id, None)
+
+async def emergency_save_all():
+    """Called during shutdown — stops all running MLX profiles to save cookies."""
+    if not running_profiles:
+        log.info("   No profiles running — clean exit.")
+        return
+    
+    log.info(f"   💾 Saving {len(running_profiles)} running profiles...")
+    
+    import httpx
+    folder_id = os.getenv("MLX_FOLDER_ID", "").strip()
+    
+    for profile_id, token in list(running_profiles.items()):
+        try:
+            stop_url = f"https://launcher.mlx.yt:45001/api/v2/profile/f/{folder_id}/p/{profile_id}/stop"
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+            async with httpx.AsyncClient(verify=False, timeout=10) as client:
+                await client.get(stop_url, headers=headers)
+            log.info(f"   ✅ {profile_id[:8]} — cookies saved")
+        except Exception as e:
+            log.warning(f"   ⚠️ {profile_id[:8]} — failed to save: {str(e)[:40]}")
+    
+    # Give MLX a moment to sync
+    await asyncio.sleep(3)
+    log.info("   💾 All profiles saved. Exiting cleanly.")
 
 # ---------------------------------------------------------------------------
 # STEALTH PATCHES (EVADE TRACKING)
@@ -171,13 +229,14 @@ async def google_session(page, profile: dict):
 # ---------------------------------------------------------------------------
 # CORE PROFILE SESSION (THE ROUTER)
 # ---------------------------------------------------------------------------
-async def warm_profile(profile: dict, token: str, run_google: bool = True, run_youtube: bool = True, run_wander: bool = True, warm_day: int = 15, strike_keyword: str = None, strike_channel: str = None):
+async def warm_profile(profile: dict, token: str, run_google: bool = True, run_youtube: bool = True, run_wander: bool = True, warm_day: int = 15, strike_keyword: str = None, strike_channel: str = None, fast_mode: bool = False):
     pid = profile["id"]
     profile_id = profile.get("profile_id")
     behavior = profile.get("behavior", {})
     browser_cfg = profile.get("browser", {"viewport": {"width": 1920, "height": 1080}})
 
-    plog(pid, f"🚀 Starting swarm sequence (Day {warm_day})")
+    mode_label = "⚡ FAST" if fast_mode else "🔄 FULL"
+    plog(pid, f"🚀 Starting swarm sequence (Day {warm_day}) [{mode_label}]")
     
     update_profile_status(pid, status="RUNNING", tasks=[])
     completed_tasks = []
@@ -204,6 +263,9 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         update_profile_status(pid, status="FAILED", error_msg=f"MLX Error: {str(e)}")
         return
 
+    # Track this profile so Ctrl+C can save its cookies
+    await register_running_profile(profile_id, token)
+
     # --- CONNECT PLAYWRIGHT ---
     async with async_playwright() as p:
         browser = None
@@ -225,6 +287,11 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
             viewport=browser_cfg.get("viewport"), locale=browser_cfg.get("locale"), timezone_id=browser_cfg.get("timezone")
         )
         await context.add_init_script(STEALTH_SCRIPT)
+        
+        # Increase default timeout from 30s to 60s — slow proxies need more time
+        context.set_default_timeout(60000)
+        context.set_default_navigation_timeout(45000)
+        
         page = context.pages[0] if context.pages else await context.new_page()
 
         vp = browser_cfg.get("viewport", {"width": 1920, "height": 1080})
@@ -238,22 +305,33 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         
         if run_google: sessions.append("google")
         if run_youtube and "youtube_strike" not in sessions: sessions.append("youtube")
-        if run_wander: sessions.append("wander")
-
-        if random.random() < 0.20: sessions.append("newsletter")
-        if random.random() < 0.30: sessions.append("maps")
-        if random.random() < 0.15: sessions.append("workspace")
-        if random.random() < 0.10: sessions.append("calendar")
-        if random.random() < 0.25: sessions.append("news")
-        if random.random() < 0.30: sessions.append("gmail") 
-        if random.random() < 0.25: sessions.append("shopping")
-        if random.random() < 0.10: sessions.append("oauth")
-        if random.random() < 0.10: sessions.append("drive")
+        
+        if fast_mode:
+            # FAST MODE: Only core sessions (Google + YouTube), no extras
+            # ~8-10 min per profile instead of ~20-25 min
+            plog(pid, f"⚡ Fast mode: {len(sessions)} core sessions only")
+        else:
+            # FULL MODE: Add optional sessions randomly
+            if run_wander: sessions.append("wander")
+            if random.random() < 0.20: sessions.append("newsletter")
+            if random.random() < 0.30: sessions.append("maps")
+            if random.random() < 0.15: sessions.append("workspace")
+            if random.random() < 0.10: sessions.append("calendar")
+            if random.random() < 0.25: sessions.append("news")
+            if random.random() < 0.30: sessions.append("gmail") 
+            if random.random() < 0.25: sessions.append("shopping")
+            if random.random() < 0.10: sessions.append("oauth")
+            if random.random() < 0.10: sessions.append("drive")
 
         random.shuffle(sessions) 
 
         # --- EXECUTE SESSIONS ---
         for session_type in sessions:
+            # Check if shutdown was requested (Ctrl+C)
+            if shutdown_requested:
+                plog(pid, "🛑 Shutdown requested — saving cookies and exiting...")
+                break
+            
             plog(pid, f"⚡ Active Task: {session_type.upper()}")
             
             try:
@@ -284,7 +362,7 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
                 plog(pid, f"⚠️ Task '{session_type}' encountered an error: {e}. Skipping.")
 
             if len(sessions) > 1 and session_type != sessions[-1]:
-                pause = random.uniform(8, 20)
+                pause = random.uniform(3, 8) if fast_mode else random.uniform(8, 20)
                 plog(pid, f"⏸ Task Transition: {pause:.0f}s break...")
                 await asyncio.sleep(pause)
 
@@ -295,6 +373,7 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         
         # 1. Stop MLX profile (saves cookies to cloud)
         await loop.run_in_executor(None, stop_profile, profile_id, token)
+        await unregister_running_profile(profile_id)
         plog(pid, "💾 Cookies saved to cloud.")
         
         # 2. Brief pause for cookie sync
@@ -317,7 +396,7 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
 # ---------------------------------------------------------------------------
 # ORCHESTRATOR
 # ---------------------------------------------------------------------------
-async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=15, region=None, strike_keyword=None, strike_channel=None, strike_window=2.0):
+async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=15, region=None, strike_keyword=None, strike_channel=None, strike_window=2.0, fast_mode=False):
     log.info("🔑 Authenticating with Multilogin...")
     try:
         token = get_token()
@@ -325,15 +404,45 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
         log.error(f"❌ Auth Failed: {e}")
         return
 
+    # Auto-refreshing token container — shared across all workers
+    token_state = {"token": token, "last_refresh": time.time()}
+    token_lock = asyncio.Lock()
+    
+    async def get_fresh_token():
+        """Get a valid token, auto-refreshing if older than 20 minutes."""
+        async with token_lock:
+            age = time.time() - token_state["last_refresh"]
+            if age > 1200:  # 20 minutes — refresh before the 30-min expiry
+                try:
+                    loop = asyncio.get_running_loop()
+                    new_token = await loop.run_in_executor(None, get_token)
+                    token_state["token"] = new_token
+                    token_state["last_refresh"] = time.time()
+                    log.info("🔑 Token auto-refreshed")
+                except Exception as e:
+                    log.warning(f"⚠️ Token refresh failed: {e} — using existing token")
+            return token_state["token"]
+
     profiles_to_run = fetch_active_profiles(selected_ids, region=region)
     if not profiles_to_run:
         log.error(f"No active profiles found in database for region: {region or 'ALL'}.")
         return
 
-    log.info(f"🚀 SWARM START: {len(profiles_to_run)} bots | Region: {region or 'GLOBAL'} | Concurrency: {max_concurrent}")
+    mode_label = "⚡ FAST" if fast_mode else "🔄 FULL"
+    log.info(f"🚀 SWARM START: {len(profiles_to_run)} bots | Region: {region or 'GLOBAL'} | Concurrency: {max_concurrent} | Mode: {mode_label}")
+    
+    if fast_mode:
+        est_per_profile = 9  # ~9 min in fast mode
+        est_total = (len(profiles_to_run) * est_per_profile) / max_concurrent
+        log.info(f"⏱️ Estimated time: ~{est_total:.0f} minutes ({est_total/60:.1f} hours)")
+    
     sem = asyncio.Semaphore(max_concurrent)
 
     async def process_profile(profile):
+        # Check if shutdown was requested before starting
+        if shutdown_requested:
+            return
+        
         # Viral Velocity Curve for Strike Missions
         base_stagger = random.uniform(1.0, 15.0)
         
@@ -344,22 +453,37 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
             plog(profile["id"], f"🕒 Viral Velocity applied. Bot will launch in {stagger/60:.1f} minutes.")
         else:
             stagger = base_stagger
-            
-        await asyncio.sleep(stagger)
+        
+        # Break stagger into small chunks so we can check for shutdown during the wait
+        waited = 0
+        while waited < stagger:
+            if shutdown_requested:
+                return
+            await asyncio.sleep(min(1.0, stagger - waited))
+            waited += 1.0
+        
+        if shutdown_requested:
+            return
         
         async with sem:
-            await warm_profile(profile, token, run_google, run_youtube, run_wander, warm_day, strike_keyword, strike_channel)
+            fresh_token = await get_fresh_token()
+            await warm_profile(profile, fresh_token, run_google, run_youtube, run_wander, warm_day, strike_keyword, strike_channel, fast_mode=fast_mode)
             update_last_run(profile["id"])
             await asyncio.sleep(random.uniform(2, 5))
 
     tasks = [process_profile(profile) for profile in profiles_to_run]
-    await asyncio.gather(*tasks)
+    await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # If shutdown was requested, do emergency save for any profiles still running
+    if shutdown_requested:
+        await emergency_save_all()
+    
     log.info("🏁 Full Farm Cycle Complete.")
 
 # ---------------------------------------------------------------------------
 # DAILY SCHEDULER
 # ---------------------------------------------------------------------------
-def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=15, region=None, strike_keyword=None, strike_channel=None, strike_window=2.0):
+def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=15, region=None, strike_keyword=None, strike_channel=None, strike_window=2.0, fast_mode=False):
     run_time = os.getenv("SCHEDULE_TIME", "09:00").strip()
     log.info(f"📅 Scheduler active — Daily target: {run_time} | Region: {region or 'GLOBAL'}")
     
@@ -377,7 +501,7 @@ def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wand
         log.info(f"⏰ Next run: {actual_target.strftime('%H:%M:%S')} (in {wait/3600:.1f}h)")
         time.sleep(max(wait, 0))
         
-        asyncio.run(run_all(selected_ids, run_google, run_youtube, run_wander, current_day, max_concurrent=concurrency, region=region, strike_keyword=strike_keyword, strike_channel=strike_channel, strike_window=strike_window))
+        asyncio.run(run_all(selected_ids, run_google, run_youtube, run_wander, current_day, max_concurrent=concurrency, region=region, strike_keyword=strike_keyword, strike_channel=strike_channel, strike_window=strike_window, fast_mode=fast_mode))
         current_day += 1
 
 # ---------------------------------------------------------------------------
@@ -396,9 +520,11 @@ if __name__ == "__main__":
     parser.add_argument("--concurrency", "-c", type=int, default=15)
     parser.add_argument("--region", "-r", type=str, default=None, help="Filter bots by timezone (e.g., 'australia', 'america')")
     
-    parser.add_argument("--strike-keyword", type=str, default=None, help="Target search phrase for YouTube Strike")
+    parser.add_argument("--strike-keyword", type=str, nargs="+", default=None, help="Target search phrases for YouTube Strike (multiple = each bot picks randomly)")
     parser.add_argument("--strike-channel", type=str, default=None, help="Exact channel name for YouTube Strike verification")
     parser.add_argument("--strike-window", type=float, default=2.0, help="Hours to organically spread the strike traffic across.")
+    parser.add_argument("--fast", action="store_true", help="Fast mode: Google + YouTube only, ~8-10 min per profile instead of ~22 min")
+    parser.add_argument("--browse-channel", action="store_true", help="Strike via channel browsing: bots visit channel page and pick videos organically")
 
     args = parser.parse_args()
 
@@ -407,17 +533,25 @@ if __name__ == "__main__":
     elif args.youtube_only: g, w = False, False
     elif args.wander_only: g, y = False, False
 
-    if (args.strike_keyword and not args.strike_channel) or (args.strike_channel and not args.strike_keyword):
-        log.error("❌ Strike Mission Error: You must provide BOTH --strike-keyword and --strike-channel.")
+    if (args.strike_keyword and not args.strike_channel) or (args.strike_channel and not args.strike_keyword and not args.browse_channel):
+        log.error("❌ Strike Mission Error: You must provide BOTH --strike-keyword and --strike-channel, or use --browse-channel with --strike-channel.")
         exit(1)
+    
+    # For browse-channel mode, set a dummy keyword so the strike module uses channel browsing
+    strike_kw = args.strike_keyword
+    if args.browse_channel and args.strike_channel and not strike_kw:
+        strike_kw = ["__browse_channel__"]
 
     if args.dry_run:
         bots = fetch_active_profiles(args.profile, region=args.region)
         log.info(f"Dry-run: {len(bots)} profiles detected for region '{args.region or 'ALL'}'.")
-        if args.strike_keyword:
-            log.info(f"Dry-run Strike Active: Targeting '{args.strike_keyword}' on channel '{args.strike_channel}' over {args.strike_window} hours.")
+        if args.fast:
+            est = (len(bots) * 9) / args.concurrency
+            log.info(f"⚡ Fast mode: ~{est:.0f} min ({est/60:.1f} hours) at -c {args.concurrency}")
+        if strike_kw:
+            log.info(f"Dry-run Strike Active: Targeting {strike_kw} on channel '{args.strike_channel}' over {args.strike_window} hours.")
     elif args.schedule:
-        run_scheduler(args.profile, g, y, w, args.day, args.concurrency, args.region, args.strike_keyword, args.strike_channel, args.strike_window)
+        run_scheduler(args.profile, g, y, w, args.day, args.concurrency, args.region, strike_kw, args.strike_channel, args.strike_window, fast_mode=args.fast)
     else:
         # NOTE: Do NOT use WindowsSelectorEventLoopPolicy — it breaks Playwright
-        asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency, region=args.region, strike_keyword=args.strike_keyword, strike_channel=args.strike_channel, strike_window=args.strike_window))
+        asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency, region=args.region, strike_keyword=strike_kw, strike_channel=args.strike_channel, strike_window=args.strike_window, fast_mode=args.fast))

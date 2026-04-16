@@ -2,8 +2,13 @@
 llm_helper.py
 -------------
 Handles dynamic generation of search terms, documents, and comments using OpenAI.
-Upgraded with Strict System Prompts and Output Sanitization to prevent 
-conversational filler from breaking the automation UI.
+
+[FIXED]:
+- Uses profile interests directly (from demographics.interests) as PRIMARY search source
+- OpenAI is an ENHANCEMENT, not a dependency — if it fails, interests are used directly
+- Reads location from the correct field path (persona.location or profile.location)
+- No more "interesting videos" fallback spam
+- Adds natural variation to interest-based searches without needing LLM
 """
 
 import os
@@ -17,6 +22,104 @@ log = logging.getLogger(__name__)
 # Initialize the async client
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+
+# ---------------------------------------------------------------------------
+# INTEREST-BASED SEARCH (NO LLM NEEDED)
+# ---------------------------------------------------------------------------
+
+def _get_profile_interests(profile: dict) -> list:
+    """Extract interests from profile, checking all possible field locations."""
+    interests = []
+    
+    # Check persona.interests (set by profiles_config.py mapper)
+    persona = profile.get("persona", {})
+    if isinstance(persona, dict):
+        interests = persona.get("interests", [])
+    
+    # Fallback: check demographics.interests directly
+    if not interests:
+        demographics = profile.get("demographics", {})
+        if isinstance(demographics, dict):
+            interests = demographics.get("interests", [])
+    
+    # Fallback: check top-level topics
+    if not interests:
+        interests = profile.get("topics", [])
+    
+    return interests if interests else []
+
+def _get_profile_location(profile: dict) -> dict:
+    """Extract location from profile, checking all possible field locations."""
+    # Check persona.location (set by profiles_config.py mapper)
+    persona = profile.get("persona", {})
+    if isinstance(persona, dict):
+        loc = persona.get("location", {})
+        if loc and loc.get("city"):
+            return loc
+    
+    # Fallback: check top-level location
+    loc = profile.get("location", {})
+    if isinstance(loc, dict) and loc.get("city"):
+        return loc
+    
+    return {}
+
+def _get_persona_info(profile: dict) -> dict:
+    """Extract persona display info."""
+    persona = profile.get("persona", {})
+    demographics = profile.get("demographics", {})
+    location = _get_profile_location(profile)
+    
+    return {
+        "name": persona.get("name") or demographics.get("name", "a user"),
+        "city": location.get("city", ""),
+        "state": location.get("state", ""),
+        "occupation": demographics.get("occupation", ""),
+    }
+
+def _pick_interest_search(profile: dict) -> str:
+    """
+    Pick a search query directly from the profile's interests.
+    These are already great search queries like "Dallas esports tournaments 2023".
+    Adds slight natural variation.
+    """
+    interests = _get_profile_interests(profile)
+    
+    if not interests:
+        # Absolute last resort — generic but varied
+        generic = [
+            "trending videos today", "things to do this weekend",
+            "best new movies 2024", "cool tech gadgets", 
+            "how to learn something new", "funny videos compilation",
+            "life hacks everyone should know", "best podcasts right now",
+            "what to watch on youtube", "interesting documentaries"
+        ]
+        return random.choice(generic)
+    
+    # Pick a random interest
+    query = random.choice(interests)
+    
+    # 30% chance to add a natural modifier
+    if random.random() < 0.30:
+        modifiers = [
+            "", "reddit", "2024", "best", "how to", 
+            "near me", "tutorial", "explained", "review", "tips"
+        ]
+        mod = random.choice(modifiers)
+        if mod:
+            # Sometimes prepend, sometimes append
+            if random.random() < 0.5:
+                query = f"{mod} {query}"
+            else:
+                query = f"{query} {mod}"
+    
+    return query
+
+
+# ---------------------------------------------------------------------------
+# LLM-ENHANCED SEARCH (OPTIONAL — FALLS BACK TO INTERESTS)
+# ---------------------------------------------------------------------------
+
 async def _safe_generate(system_prompt: str, user_prompt: str, token_limit: int, temp: float) -> str:
     """Internal helper to securely call OpenAI and strip conversational filler."""
     try:
@@ -29,12 +132,13 @@ async def _safe_generate(system_prompt: str, user_prompt: str, token_limit: int,
             temperature=temp, 
             max_tokens=token_limit,
             presence_penalty=0.6, 
-            frequency_penalty=0.3
+            frequency_penalty=0.3,
+            timeout=10  # Don't hang forever
         )
         
         output = response.choices[0].message.content.strip()
         
-        # Aggressive Sanitization: Remove rogue quotes, asterisks, or conversational prefixes
+        # Aggressive Sanitization
         output = output.strip('\'"*.')
         output = re.sub(r"^(here is|sure,?|the domain is|query:)\s*", "", output, flags=re.IGNORECASE).strip()
         
@@ -44,21 +148,45 @@ async def _safe_generate(system_prompt: str, user_prompt: str, token_limit: int,
         log.warning(f"    ⚠️ LLM generation failed: {e}")
         return ""
 
-async def generate_dynamic_search(profile: dict, platform: str) -> str:
-    persona = profile.get("persona", {})
-    
-    # 1. Pick just ONE topic to focus on today
-    focus_topic = random.choice(profile.get("topics", ["interesting videos"]))
-        
-    user_prompt = f"I am {persona.get('name', 'a user')}, a {persona.get('age', '30')}-year-old living in {persona.get('city', 'a city')}. My current focus is: '{focus_topic}'."
 
-    # 2. Base System Prompt (Enforces strict robotic compliance)
+async def generate_dynamic_search(profile: dict, platform: str) -> str:
+    """
+    Generate a search query for the given platform.
+    
+    Strategy:
+    1. Try OpenAI for a creative, varied query (50% of the time)
+    2. If OpenAI fails OR 50% of the time, use profile interests directly
+    3. Profile interests are already excellent localized queries
+    """
+    interests = _get_profile_interests(profile)
+    info = _get_persona_info(profile)
+    location = _get_profile_location(profile)
+    
+    # Pick a focus topic from interests
+    focus_topic = random.choice(interests) if interests else "interesting videos"
+    
+    # Build context for LLM
+    city = location.get("city", "a city")
+    state = location.get("state", "")
+    name = info.get("name", "a user")
+    occupation = info.get("occupation", "")
+    
+    user_prompt = (
+        f"I am {name}, "
+        f"{f'a {occupation} ' if occupation else ''}"
+        f"living in {city}{f', {state}' if state else ''}. "
+        f"My current interest: '{focus_topic}'."
+    )
+
+    # Base System Prompt
     base_system = (
         "You are the internal thought process of a human web user. "
         "CRITICAL RULE: Never explain yourself. Never use conversational filler like 'Sure' or 'Here is'. "
         "Output ONLY the exact raw text requested, without quotation marks."
     )
 
+    # --- PLATFORM-SPECIFIC GENERATION ---
+    
     if platform == "Google Docs Draft":
         system_prompt = base_system + " Write a realistic, 3-to-4 sentence paragraph about the user's interest. Do NOT use hashtags, emojis, or titles."
         output = await _safe_generate(system_prompt, user_prompt, 150, 0.85)
@@ -81,8 +209,6 @@ async def generate_dynamic_search(profile: dict, platform: str) -> str:
             "Do NOT include https:// or www."
         )
         output = await _safe_generate(system_prompt, user_prompt, 15, 0.5)
-        
-        # Extra post-processing for domains
         output = output.lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
         return output or "amazon.com"
 
@@ -97,22 +223,34 @@ async def generate_dynamic_search(profile: dict, platform: str) -> str:
         return output or "references"
 
     else:
-        # Standard Search Query Logic
-        intents = [
-            "troubleshoot a specific problem", "find a beginner tutorial", 
-            "find entertaining long-form content", "buy something cheap", 
-            "find the latest drama/news", "find an obscure weird fact"
-        ]
-        intent = random.choice(intents)
-        modifiers = ["reddit", "step by step", "for dummies", "vs", "review", "explained", "near me"]
-        mod = f" Optionally include '{random.choice(modifiers)}'." if random.random() < 0.4 else ""
+        # --- STANDARD SEARCH (YouTube, Google, etc.) ---
+        # 50% chance: use LLM for creative variation
+        # 50% chance: use profile interests directly (already great queries)
+        use_llm = random.random() < 0.50 and interests
+        
+        if use_llm:
+            intents = [
+                "troubleshoot a specific problem", "find a beginner tutorial", 
+                "find entertaining long-form content", "buy something cheap", 
+                "find the latest drama/news", "find an obscure weird fact"
+            ]
+            intent = random.choice(intents)
+            modifiers = ["reddit", "step by step", "for dummies", "vs", "review", "explained", "near me"]
+            mod = f" Optionally include '{random.choice(modifiers)}'." if random.random() < 0.4 else ""
 
-        system_prompt = base_system + f" Situation: The user wants to {intent} regarding their interest. Generate ONE casual, highly specific web search query. Make it sound human.{mod}"
-        output = await _safe_generate(system_prompt, user_prompt, 20, 0.9)
-        return output or focus_topic
+            system_prompt = base_system + f" Situation: The user wants to {intent} regarding their interest. Generate ONE casual, highly specific web search query. Make it sound human.{mod}"
+            output = await _safe_generate(system_prompt, user_prompt, 20, 0.9)
+            
+            if output:
+                return output
+        
+        # Direct interest-based search (no LLM needed — these are already perfect)
+        return _pick_interest_search(profile)
+
 
 async def generate_contextual_comment(profile: dict, video_title: str, video_desc: str) -> str:
-    persona = profile.get("persona", {})
+    """Generate a contextual YouTube comment."""
+    info = _get_persona_info(profile)
     safe_desc = video_desc[:500].replace("\n", " ") if video_desc else "No description."
     
     vibes = [
@@ -135,7 +273,14 @@ async def generate_contextual_comment(profile: dict, video_title: str, video_des
     )
     
     user_prompt = (
-        f"I am {persona.get('name', 'a user')}, a {persona.get('age', '30')}-year-old from {persona.get('city', 'a city')}. "
+        f"I am {info['name']}, "
+    )
+    occupation = info.get("occupation", "")
+    if occupation:
+        user_prompt += f"a {occupation} "
+    city = info.get("city") or "somewhere"
+    user_prompt += (
+        f"from {city}. "
         f"I watched '{video_title}'. Context: '{safe_desc}'. "
         f"VIBE: {random.choice(vibes)}. FORMATTING: {random.choice(formats)}. Keep under 15 words."
     )
@@ -146,5 +291,11 @@ async def generate_contextual_comment(profile: dict, video_title: str, video_des
         log.info(f"    🧠 LLM generated comment: '{output}'")
         return output
     else:
-        fallbacks = ["this is actually crazy tbh", "saving this for later", "i needed this today lol", "wait is this actually real?"]
+        fallbacks = [
+            "this is actually crazy tbh", "saving this for later", 
+            "i needed this today lol", "wait is this actually real?",
+            "bro this is exactly what i was looking for",
+            "why did it take me so long to find this",
+            "ngl this actually helped a lot"
+        ]
         return random.choice(fallbacks)

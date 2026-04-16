@@ -115,7 +115,16 @@ def start_profile(profile_id: str, token: str) -> str:
                     log.warning(f"    ⚠️ No port in MLX response: {data}")
 
             elif response.status_code == 401:
-                raise PermissionError("Token expired — restart script")
+                log.warning(f"    🔄 [{profile_id[:8]}] Token expired. Refreshing...")
+                try:
+                    from auth import get_token as refresh_token
+                    new_token = refresh_token()
+                    token = new_token
+                    headers["Authorization"] = f"Bearer {token}"
+                    log.info(f"    🔑 [{profile_id[:8]}] Token refreshed. Retrying...")
+                    continue  # Retry with new token
+                except Exception as refresh_err:
+                    raise PermissionError(f"Token expired and refresh failed: {refresh_err}")
 
             elif response.status_code == 429:
                 log.warning(f"    ⏳ MLX API Rate limited, waiting 10s (attempt {attempt+1}/3)")

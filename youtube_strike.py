@@ -1,7 +1,6 @@
 """
 youtube_strike.py
 -----------------
-The "Red Zone" Target Execution Module.
 
 Upgraded with:
 - External Traffic Spoofing (Google, YouTube Search, Channel Page, Recommendations)
@@ -52,21 +51,26 @@ def _is_shutdown():
 
 async def handle_youtube_consent(page: Page, behavior: dict):
     """Clears YouTube cookie consent banner if present."""
+    # Wait 3 seconds to ensure the consent modal has actually rendered
+    await page.wait_for_timeout(3000)
+    
     selectors = [
-        "button[aria-label*='Accept' i]", "button:has-text('Accept all')",
-        "ytd-button-renderer:has-text('Accept all')", ".ytd-consent-bump-v2-renderer button"
+        "button[aria-label*='Accept' i]", 
+        "button:has-text('Accept all')",
+        "button:has-text('Alle akzeptieren')", # Common European proxy fallback
+        "ytd-button-renderer:has-text('Accept all')", 
+        ".ytd-consent-bump-v2-renderer button"
     ]
     for sel in selectors:
         try:
             btn = page.locator(sel).first
             if await btn.is_visible(timeout=2000):
-                await click_humanly(page, btn, behavior)
+                await btn.click(force=True) # Force click bypasses tricky z-indexes
                 log.info("    🍪 Cleared YouTube consent banner.")
-                await asyncio.sleep(random.uniform(1.5, 3.0))
+                await page.wait_for_timeout(3000) # Give UI time to remove overlay
                 return
         except Exception:
             pass
-
 async def handle_ads(page: Page, behavior: dict, pid: str):
     """Handles YouTube ads during playback. Sometimes watches full ad for trust."""
     try:
@@ -208,63 +212,88 @@ async def route_channel_page(page: Page, pid: str, behavior: dict, channel: str,
     """Route C: Find video via channel page (browse videos tab)."""
     log.info(f"    🛣️ [{pid[:8]}] Route: Channel Page Browse...")
     
-    if "youtube.com" not in page.url:
-        await page.goto("https://www.youtube.com", wait_until="domcontentloaded")
+    # ---------------------------------------------------------
+    # 1. NAVIGATION: Direct URL vs. Native Search
+    # ---------------------------------------------------------
+    if channel.startswith("http"):
+        log.info(f"    🌐 [{pid[:8]}] Direct URL detected, navigating straight to channel...")
+        await page.goto(channel, wait_until="domcontentloaded")
         await handle_youtube_consent(page, behavior)
-        await smart_wait(page)
-    
-    # Clear and search for the channel
-    search_box = page.locator("input#search, input[name='search_query']").first
-    await click_humanly(page, search_box, behavior)
-    await clear_search_box(page, "input#search")
-    
-    await human_type(page, "input#search", channel, behavior)
-    await page.keyboard.press("Enter")
-    await smart_wait(page, timeout=5000)
-    
-    # Find the channel in results
-    channel_link = page.locator(f"ytd-channel-renderer:has-text('{channel}') a#main-link").first
-    if not await channel_link.is_visible(timeout=5000):
-        # Try alternative selector
-        channel_link = page.locator(f"ytd-channel-renderer a#main-link").first
-    
-    if await channel_link.is_visible(timeout=3000):
-        await click_humanly(page, channel_link, behavior)
+        await smart_wait(page, timeout=5000)
+    else:
+        # If it's just a name, search for it natively
+        if "youtube.com" not in page.url:
+            await page.goto("https://www.youtube.com", wait_until="domcontentloaded")
+            await handle_youtube_consent(page, behavior)
+            await smart_wait(page)
+        
+        # Clear and search for the channel
+        search_box = page.locator("input#search, input[name='search_query']").first
+        await click_humanly(page, search_box, behavior)
+        await clear_search_box(page, "input#search")
+        
+        await human_type(page, "input#search", channel, behavior)
+        await page.keyboard.press("Enter")
         await smart_wait(page, timeout=5000)
         
-        # Browse a bit on the channel page (consideration telemetry)
-        log.info(f"    👀 [{pid[:8]}] Browsing channel page...")
-        await idle_reading(page, {**behavior, "read_pause_range": (2, 5)})
+        # Find the channel in results
+        channel_link = page.locator(f"ytd-channel-renderer:has-text('{channel}') a#main-link").first
+        if not await channel_link.is_visible(timeout=5000):
+            # Try alternative selector
+            channel_link = page.locator(f"ytd-channel-renderer a#main-link").first
         
-        # Click Videos tab
-        videos_tab = page.locator("div.yt-tab-shape-wiz__tab:has-text('Videos')").first
-        if await videos_tab.is_visible(timeout=3000):
-            await click_humanly(page, videos_tab, behavior)
-            await smart_wait(page, timeout=3000)
+        if await channel_link.is_visible(timeout=3000):
+            await click_humanly(page, channel_link, behavior)
+            await smart_wait(page, timeout=5000)
+        else:
+            log.warning(f"    ⚠️ [{pid[:8]}] Could not find channel link in search results.")
+            return False
+
+    # ---------------------------------------------------------
+    # 2. BROWSE VIDEOS TAB
+    # ---------------------------------------------------------
+    log.info(f"    👀 [{pid[:8]}] Browsing channel page...")
+    await idle_reading(page, {**behavior, "read_pause_range": (2, 5)})
+    
+    # Click Videos tab (Using multiple fallbacks for YouTube's UI variations)
+    videos_tab = page.locator("div.yt-tab-shape-wiz__tab:has-text('Videos'), div.tp-yt-paper-tab:has-text('Videos')").first
+    if await videos_tab.is_visible(timeout=5000):
+        await click_humanly(page, videos_tab, behavior)
+        await page.wait_for_timeout(3000) # Wait for network request to fetch videos
+    
+    # ---------------------------------------------------------
+    # 3. EXPLICIT WAIT FOR VIDEO RENDER (Proxy Safeguard)
+    # ---------------------------------------------------------
+    log.info(f"    ⏳ [{pid[:8]}] Waiting for videos to load...")
+    try:
+        # Give slow proxies up to 15 seconds to load the video grid
+        await page.locator("a#video-title-link, a#video-title").first.wait_for(state="visible", timeout=15000)
+    except Exception:
+        log.warning(f"    ⚠️ [{pid[:8]}] Videos never loaded on channel page. Proxy too slow or channel is empty.")
+        return False
+
+    # ---------------------------------------------------------
+    # 4. PICK A VIDEO & CLICK
+    # ---------------------------------------------------------
+    video_links = await page.locator("a#video-title-link, a#video-title").all()
+    
+    if video_links:
+        if pick_random_video and len(video_links) > 1:
+            # Pick from first 5 videos with weighted preference for newer ones
+            pool = video_links[:min(5, len(video_links))]
+            weights = [0.35, 0.25, 0.20, 0.12, 0.08][:len(pool)]
+            target_vid = random.choices(pool, weights=weights, k=1)[0]
+            log.info(f"    🎲 [{pid[:8]}] Picked random video from channel (1 of {len(pool)})")
+        else:
+            target_vid = video_links[0]
+            log.info(f"    📌 [{pid[:8]}] Picking latest video from channel")
         
-        # Pick a video
-        video_links = await page.locator("ytd-rich-item-renderer a#video-title-link").all()
-        if not video_links:
-            video_links = await page.locator("ytd-grid-video-renderer a#video-title").all()
-        
-        if video_links:
-            if pick_random_video and len(video_links) > 1:
-                # Pick from first 5 videos with weighted preference for newer ones
-                pool = video_links[:min(5, len(video_links))]
-                weights = [0.35, 0.25, 0.20, 0.12, 0.08][:len(pool)]
-                target_vid = random.choices(pool, weights=weights, k=1)[0]
-                log.info(f"    🎲 [{pid[:8]}] Picked random video from channel (1 of {len(pool)})")
-            else:
-                target_vid = video_links[0]
-                log.info(f"    📌 [{pid[:8]}] Picking latest video from channel")
-            
-            await target_vid.scroll_into_view_if_needed()
-            await asyncio.sleep(random.uniform(0.5, 1.5))
-            await click_humanly(page, target_vid, behavior)
-            return True
+        await target_vid.scroll_into_view_if_needed()
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        await click_humanly(page, target_vid, behavior)
+        return True
     
     return False
-
 async def route_recommendation(page: Page, pid: str, behavior: dict, keyword: str, channel: str) -> bool:
     """Route D: Find video via YouTube recommendations (watch a related video first, then find target in sidebar)."""
     log.info(f"    🔄 [{pid[:8]}] Route: Recommendation Discovery...")
@@ -356,53 +385,57 @@ async def execute_target_strike(page: Page, profile: dict, target_keyword, targe
     log.info(f"🎯 [{pid[:8]}] INITIATING TARGET STRIKE: '{keyword}' -> {target_channel} (Day {warm_day})")
 
     try:
-        # --- BAILOUT ENTROPY ---
+       # --- BAILOUT ENTROPY ---
         # 5% chance the bot "isn't interested" and bounces (realistic organic behavior)
         if random.random() < 0.05:
             log.info(f"    🏃 [{pid[:8]}] [BAILOUT] Bot decided not to search today. Skipping strike.")
             return
 
+        # ---------------------------------------------------------
+        # NEW: HOMEPAGE SEED WARMUP (Build organic session history)
+        # ---------------------------------------------------------
+        if browse_mode and random.random() < 0.85: # 85% chance to warm up first
+            log.info(f"    📺 [{pid[:8]}] Building session history: Going to homepage first...")
+            await page.goto("https://www.youtube.com", wait_until="domcontentloaded")
+            await handle_youtube_consent(page, behavior)
+            await smart_wait(page, timeout=5000)
+            
+            # Grab top videos from the homepage
+            home_vids = await page.locator("ytd-rich-item-renderer a#video-title-link").all()
+            if home_vids:
+                seed_vid = random.choice(home_vids[:10]) # Pick randomly from top 10
+                await seed_vid.scroll_into_view_if_needed()
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+                await click_humanly(page, seed_vid, behavior)
+                
+                # Watch for 1 to 2.5 minutes
+                seed_watch = random.uniform(60, 150) 
+                log.info(f"    🍿 [{pid[:8]}] Watching random seed video for {seed_watch:.0f}s before striking...")
+                
+                # Wait 15s to let the video start, check for an ad, then finish waiting
+                await asyncio.sleep(15) 
+                await handle_ads(page, behavior, pid)
+                await asyncio.sleep(max(0, seed_watch - 15))
+
         # --- DISCOVERY ROUTING (Traffic Diversification) ---
         found_target = False
-        
-        if browse_mode:
-            # Browse-channel mode: go directly to channel page and pick a video
-            found_target = await route_channel_page(page, pid, behavior, target_channel, pick_random_video=True)
-            if not found_target:
-                # Fallback: YouTube search for the channel
-                found_target = await route_youtube_search(page, pid, behavior, target_channel, target_channel)
-        else:
-            # Normal strike: each bot takes a different discovery path
-            route_roll = random.random()
-
-            if route_roll < 0.30:
-                found_target = await route_google_search(page, pid, behavior, keyword, target_channel)
-            
-            if not found_target and route_roll < 0.60:
-                found_target = await route_youtube_search(page, pid, behavior, keyword, target_channel)
-            
-            if not found_target and route_roll < 0.80:
-                found_target = await route_channel_page(page, pid, behavior, target_channel)
-            
-            if not found_target:
-                found_target = await route_recommendation(page, pid, behavior, keyword, target_channel)
-
-        # Last resort: channel page fallback
-        if not found_target:
-            log.info(f"    🔄 [{pid[:8]}] All routes failed. Trying direct channel fallback...")
-            found_target = await route_channel_page(page, pid, behavior, target_channel, pick_random_video=False)
-
-        if not found_target:
-            log.warning(f"    ❌ [{pid[:8]}] Target not found through any route. Aborting strike.")
-            return
-
-        await smart_wait(page, timeout=10000)
 
         # --- PREPARATION ---
         await force_360p(page, pid, behavior)
-        await page.locator("body").click(force=True)  # Ensure page focus
-
+        # Safely ensure focus without triggering Playwright viewport geometry errors
+        await page.mouse.click(5, 5) 
+        await page.evaluate("window.focus()")
         # --- CALCULATE WATCH TIME ---
+        target_watch_time = int(total_seconds * watch_pct)
+        log.info(f"    ⏱️ [{pid[:8]}] Watch plan: {watch_pct*100:.1f}% ({target_watch_time}s of {total_seconds}s)")
+
+        # ---------------------------------------------------------
+        # NEW: MAXIMUM WATCH TIME CAP (e.g., 10 minutes / 600 seconds)
+        # ---------------------------------------------------------
+        max_time_seconds = 600 
+        if target_watch_time > max_time_seconds:
+            log.info(f"    ⏳ [{pid[:8]}] Capping marathon session from {target_watch_time}s to {max_time_seconds}s.")
+            target_watch_time = max_time_seconds
         duration_str = "5:00"
         try:
             dur_el = page.locator(".ytp-time-duration").first

@@ -12,9 +12,13 @@ Complete production-ready brain for browser warming and targeted strikes.
 
 [FIXED]:
 - truststore SSL fix for Multilogin X desktop app compatibility
-- Cookie save order: MLX stop BEFORE Playwright close
-- Proxy error handling (skip dead proxies gracefully)
+- Cookie save order: Playwright closes FIRST, then MLX stops with verification
+- Proxy error handling: probe recovery before aborting (handles transient drops)
 - No WindowsSelectorEventLoopPolicy (breaks Playwright on Windows)
+- Shutdown verification: retries MLX stop until profile actually closes
+- Skip profiles already warmed in last N hours (prevents re-running on crash recovery)
+- Mid-session proxy drops on ANY task (youtube, gmail, maps, etc.) now recover
+  gracefully instead of killing the whole profile
 """
 
 import asyncio
@@ -24,9 +28,10 @@ import os
 import random
 import signal
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -80,34 +85,48 @@ def plog(profile_id: str, msg: str):
     log.info(f"{icon} [{profile_id[:15]:15s}] {msg}")
 
 # ---------------------------------------------------------------------------
+# PROXY ERROR DETECTION
+# ---------------------------------------------------------------------------
+# All Chromium errors that mean "proxy hiccup" rather than "page broken".
+# Applies to ANY session type — google, youtube, gmail, maps, shopping, etc.
+PROXY_ERROR_SIGNATURES = (
+    "ERR_INVALID_AUTH_CREDENTIALS",
+    "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_PROXY_AUTH_REQUESTED",
+    "ERR_PROXY_AUTH_UNSUPPORTED",
+    "ERR_PROXY_CERTIFICATE_INVALID",
+    "ERR_HTTPS_PROXY_TUNNEL_RESPONSE_REDIRECT",
+)
+
+def is_proxy_error(error_msg: str) -> bool:
+    """Returns True if the error string indicates a proxy-layer problem."""
+    return any(sig in error_msg for sig in PROXY_ERROR_SIGNATURES)
+
+
+# ---------------------------------------------------------------------------
 # GRACEFUL SHUTDOWN SYSTEM
 # ---------------------------------------------------------------------------
-# Tracks all currently running profiles so Ctrl+C can save cookies before exit
 shutdown_requested = False
 running_profiles = {}  # {profile_id: token} — profiles currently in a browser session
-running_profiles_lock = asyncio.Lock() if hasattr(asyncio, 'Lock') else None
 
 def request_shutdown(signum=None, frame=None):
     """Called on Ctrl+C. Sets flag so workers stop picking up new profiles."""
     global shutdown_requested
     if shutdown_requested:
-        # Second Ctrl+C = force kill
         log.warning("\n⚠️ Force kill! Cookies may not be saved.")
         os._exit(1)
     shutdown_requested = True
     log.warning("\n🛑 SHUTDOWN REQUESTED — Saving cookies for all running profiles...")
     log.warning("   (Press Ctrl+C again to force quit without saving)")
 
-# Register the signal handler
 signal.signal(signal.SIGINT, request_shutdown)
 
 async def register_running_profile(profile_id: str, token: str):
-    """Track a profile as currently running."""
     global running_profiles
     running_profiles[profile_id] = token
 
 async def unregister_running_profile(profile_id: str):
-    """Remove a profile from the running tracker."""
     global running_profiles
     running_profiles.pop(profile_id, None)
 
@@ -118,8 +137,6 @@ async def emergency_save_all():
         return
     
     log.info(f"   💾 Saving {len(running_profiles)} running profiles...")
-    
-    import httpx
     folder_id = os.getenv("MLX_FOLDER_ID", "").strip()
     
     for profile_id, token in list(running_profiles.items()):
@@ -132,9 +149,82 @@ async def emergency_save_all():
         except Exception as e:
             log.warning(f"   ⚠️ {profile_id[:8]} — failed to save: {str(e)[:40]}")
     
-    # Give MLX a moment to sync
     await asyncio.sleep(3)
     log.info("   💾 All profiles saved. Exiting cleanly.")
+
+
+# ---------------------------------------------------------------------------
+# SHUTDOWN VERIFICATION — ensure MLX actually closed the profile
+# ---------------------------------------------------------------------------
+async def verify_profile_stopped(profile_uuid: str, token: str, pid: str, max_retries: int = 3):
+    """
+    Verifies an MLX profile actually stopped. If not, re-sends stop signal.
+    
+    MLX returns:
+      - 200 if the profile WAS running and is now stopping → still active, retry
+      - 404 if the profile is NOT running → stopped confirmed
+    """
+    folder_id = os.getenv("MLX_FOLDER_ID", "").strip()
+    if not folder_id:
+        return
+    
+    stop_url = f"https://launcher.mlx.yt:45001/api/v2/profile/f/{folder_id}/p/{profile_uuid}/stop"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    
+    for attempt in range(max_retries):
+        await asyncio.sleep(2 + attempt)
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=10) as client:
+                resp = await client.get(stop_url, headers=headers)
+                
+                if resp.status_code == 404:
+                    plog(pid, "✅ MLX profile confirmed stopped.")
+                    return True
+                elif resp.status_code == 200:
+                    plog(pid, f"⚠️ MLX still had profile running, re-sent stop (try {attempt+1}/{max_retries})")
+                else:
+                    plog(pid, f"⚠️ Unexpected verify status {resp.status_code}")
+                    return False
+        except Exception as e:
+            plog(pid, f"⚠️ Verify failed: {str(e)[:50]}")
+    
+    plog(pid, f"⚠️ Profile may still be running in MLX after {max_retries} stop attempts.")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# PROXY RECOVERY — probe whether a proxy is back after a hiccup
+# ---------------------------------------------------------------------------
+async def probe_proxy_recovery(page, pid: str, wait_seconds: int = 10) -> bool:
+    """
+    Called after a proxy error on ANY task. Waits, then probes a lightweight URL
+    through the same browser to see if the proxy has recovered.
+    
+    Returns True if recovered, False if proxy is genuinely dead.
+    
+    Why generate_204? Tiny endpoint Google uses for connectivity checks.
+    Loads in milliseconds, no parsing, perfect for "is the proxy alive" probes.
+    """
+    plog(pid, f"⏳ Waiting {wait_seconds}s for proxy to recover...")
+    await asyncio.sleep(wait_seconds)
+    
+    probe_urls = [
+        "https://www.google.com/generate_204",
+        "https://www.gstatic.com/generate_204",
+    ]
+    
+    for probe_url in probe_urls:
+        try:
+            await page.goto(probe_url, wait_until="domcontentloaded", timeout=15000)
+            return True
+        except Exception as e:
+            err = str(e)
+            if not is_proxy_error(err):
+                # Non-proxy error on probe — try the next probe URL
+                continue
+    
+    return False
+
 
 # ---------------------------------------------------------------------------
 # STEALTH PATCHES (EVADE TRACKING)
@@ -240,6 +330,8 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
     
     update_profile_status(pid, status="RUNNING", tasks=[])
     completed_tasks = []
+    proxy_recovery_attempts = 0
+    MAX_PROXY_RECOVERIES = 2  # Allow up to 2 proxy recoveries per profile
 
     if not profile_id:
         plog(pid, "❌ Missing profile_id in profile data.")
@@ -263,12 +355,14 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         update_profile_status(pid, status="FAILED", error_msg=f"MLX Error: {str(e)}")
         return
 
-    # Track this profile so Ctrl+C can save its cookies
     await register_running_profile(profile_id, token)
+
+    page = None
+    context = None
+    browser = None
 
     # --- CONNECT PLAYWRIGHT ---
     async with async_playwright() as p:
-        browser = None
         for attempt in range(3):
             try:
                 browser = await p.chromium.connect_over_cdp(ws_url, timeout=15000)
@@ -280,6 +374,8 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         if not browser:
             plog(pid, f"❌ Playwright CDP Fail after 3 attempts.")
             await loop.run_in_executor(None, stop_profile, profile_id, token)
+            await verify_profile_stopped(profile_id, token, pid)
+            await unregister_running_profile(profile_id)
             update_profile_status(pid, status="FAILED", error_msg="CDP Connection Failed")
             return
 
@@ -288,9 +384,8 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         )
         await context.add_init_script(STEALTH_SCRIPT)
         
-        # Increase default timeout from 30s to 60s — slow proxies need more time
         context.set_default_timeout(60000)
-        context.set_default_navigation_timeout(45000)
+        context.set_default_navigation_timeout(90000)
         
         page = context.pages[0] if context.pages else await context.new_page()
 
@@ -307,11 +402,8 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         if run_youtube and "youtube_strike" not in sessions: sessions.append("youtube")
         
         if fast_mode:
-            # FAST MODE: Only core sessions (Google + YouTube), no extras
-            # ~8-10 min per profile instead of ~20-25 min
             plog(pid, f"⚡ Fast mode: {len(sessions)} core sessions only")
         else:
-            # FULL MODE: Add optional sessions randomly
             if run_wander: sessions.append("wander")
             if random.random() < 0.20: sessions.append("newsletter")
             if random.random() < 0.30: sessions.append("maps")
@@ -327,7 +419,6 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
 
         # --- EXECUTE SESSIONS ---
         for session_type in sessions:
-            # Check if shutdown was requested (Ctrl+C)
             if shutdown_requested:
                 plog(pid, "🛑 Shutdown requested — saving cookies and exiting...")
                 break
@@ -355,31 +446,38 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
                 plog(pid, f"⚠️ Task '{session_type}' timed out. Skipping to next module.")
             except Exception as e:
                 error_msg = str(e)
-                # If proxy died mid-session, stop everything for this profile
-                if "ERR_INVALID_AUTH_CREDENTIALS" in error_msg or "ERR_PROXY_CONNECTION_FAILED" in error_msg:
-                    plog(pid, f"❌ Proxy died during '{session_type}'. Aborting remaining tasks.")
-                    break
-                plog(pid, f"⚠️ Task '{session_type}' encountered an error: {e}. Skipping.")
+                
+                # PROXY HICCUP — recover instead of aborting (works for ANY task)
+                if is_proxy_error(error_msg):
+                    plog(pid, f"⚠️ Proxy hiccup during '{session_type}'.")
+                    
+                    if proxy_recovery_attempts >= MAX_PROXY_RECOVERIES:
+                        plog(pid, f"❌ Proxy has failed {MAX_PROXY_RECOVERIES}+ times. Aborting remaining tasks.")
+                        break
+                    
+                    proxy_recovery_attempts += 1
+                    recovered = await probe_proxy_recovery(page, pid, wait_seconds=10)
+                    
+                    if recovered:
+                        plog(pid, f"✅ Proxy recovered ({proxy_recovery_attempts}/{MAX_PROXY_RECOVERIES}). Continuing to next task.")
+                        # Don't break — fall through to next task
+                    else:
+                        plog(pid, f"❌ Proxy still dead after probe. Aborting remaining tasks.")
+                        break
+                else:
+                    # Non-proxy error — log and skip just this one task
+                    plog(pid, f"⚠️ Task '{session_type}' encountered an error: {str(e)[:80]}. Skipping.")
 
             if len(sessions) > 1 and session_type != sessions[-1]:
                 pause = random.uniform(3, 8) if fast_mode else random.uniform(8, 20)
                 plog(pid, f"⏸ Task Transition: {pause:.0f}s break...")
                 await asyncio.sleep(pause)
 
-        # --- SHUTDOWN: CORRECT ORDER ---
-        # IMPORTANT: Stop MLX profile FIRST to save cookies, THEN close Playwright
-        plog(pid, "✅ Daily routine completed. Saving cookies...")
+        # --- SHUTDOWN: Close Playwright FIRST, then MLX, then verify ---
+        plog(pid, f"✅ Daily routine completed ({len(completed_tasks)}/{len(sessions)} tasks). Saving cookies...")
         update_profile_status(pid, status="SUCCESS", tasks=completed_tasks)
         
-        # 1. Stop MLX profile (saves cookies to cloud)
-        await loop.run_in_executor(None, stop_profile, profile_id, token)
-        await unregister_running_profile(profile_id)
-        plog(pid, "💾 Cookies saved to cloud.")
-        
-        # 2. Brief pause for cookie sync
-        await asyncio.sleep(3)
-        
-        # 3. Now close Playwright (browser is already closed by MLX stop)
+        # 1. Close Playwright first — disconnects CDP cleanly so MLX can shut down
         try:
             await page.close()
         except Exception: pass
@@ -390,13 +488,26 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
             await browser.close()
         except Exception: pass
         
+        # 2. Brief pause so Playwright fully releases the CDP connection
+        await asyncio.sleep(2)
+        
+        # 3. Send stop signal to MLX (saves cookies to cloud)
+        await loop.run_in_executor(None, stop_profile, profile_id, token)
+        plog(pid, "💾 Stop signal sent, verifying shutdown...")
+        
+        # 4. Verify MLX actually stopped the profile (retries until confirmed)
+        await verify_profile_stopped(profile_id, token, pid, max_retries=3)
+        
+        # 5. Remove from running tracker
+        await unregister_running_profile(profile_id)
+        
         plog(pid, "🏁 Profile session complete.")
 
 
 # ---------------------------------------------------------------------------
 # ORCHESTRATOR
 # ---------------------------------------------------------------------------
-async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=15, region=None, strike_keyword=None, strike_channel=None, strike_window=2.0, fast_mode=False):
+async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, max_concurrent=15, region=None, strike_keyword=None, strike_channel=None, strike_window=2.0, fast_mode=False, skip_recent_hours=0):
     log.info("🔑 Authenticating with Multilogin...")
     try:
         token = get_token()
@@ -404,15 +515,13 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
         log.error(f"❌ Auth Failed: {e}")
         return
 
-    # Auto-refreshing token container — shared across all workers
     token_state = {"token": token, "last_refresh": time.time()}
     token_lock = asyncio.Lock()
     
     async def get_fresh_token():
-        """Get a valid token, auto-refreshing if older than 20 minutes."""
         async with token_lock:
             age = time.time() - token_state["last_refresh"]
-            if age > 1200:  # 20 minutes — refresh before the 30-min expiry
+            if age > 1200:
                 try:
                     loop = asyncio.get_running_loop()
                     new_token = await loop.run_in_executor(None, get_token)
@@ -428,22 +537,46 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
         log.error(f"No active profiles found in database for region: {region or 'ALL'}.")
         return
 
+    # Skip profiles warmed recently
+    if skip_recent_hours > 0:
+        from profiles_config import get_supabase_client
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=skip_recent_hours)).isoformat()
+        try:
+            sb = get_supabase_client()
+            recent_resp = sb.table("profiles")\
+                .select("profile_id, last_used_at")\
+                .eq("status", "google_logged_in")\
+                .gte("last_used_at", cutoff)\
+                .execute()
+            recent_ids = {r["profile_id"] for r in (recent_resp.data or [])}
+            
+            before = len(profiles_to_run)
+            profiles_to_run = [p for p in profiles_to_run if p.get("id") not in recent_ids]
+            skipped = before - len(profiles_to_run)
+            
+            if skipped > 0:
+                log.info(f"⏭️ Skipping {skipped} profiles warmed in last {skip_recent_hours}h")
+        except Exception as e:
+            log.warning(f"Could not filter recent profiles: {e}")
+    
+    if not profiles_to_run:
+        log.info(f"✅ All profiles already warmed within last {skip_recent_hours}h. Nothing to do.")
+        return
+
     mode_label = "⚡ FAST" if fast_mode else "🔄 FULL"
     log.info(f"🚀 SWARM START: {len(profiles_to_run)} bots | Region: {region or 'GLOBAL'} | Concurrency: {max_concurrent} | Mode: {mode_label}")
     
     if fast_mode:
-        est_per_profile = 9  # ~9 min in fast mode
+        est_per_profile = 9
         est_total = (len(profiles_to_run) * est_per_profile) / max_concurrent
         log.info(f"⏱️ Estimated time: ~{est_total:.0f} minutes ({est_total/60:.1f} hours)")
     
     sem = asyncio.Semaphore(max_concurrent)
 
     async def process_profile(profile):
-        # Check if shutdown was requested before starting
         if shutdown_requested:
             return
         
-        # Viral Velocity Curve for Strike Missions
         base_stagger = random.uniform(1.0, 15.0)
         
         if strike_keyword:
@@ -454,7 +587,6 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
         else:
             stagger = base_stagger
         
-        # Break stagger into small chunks so we can check for shutdown during the wait
         waited = 0
         while waited < stagger:
             if shutdown_requested:
@@ -474,7 +606,6 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
     tasks = [process_profile(profile) for profile in profiles_to_run]
     await asyncio.gather(*tasks, return_exceptions=True)
     
-    # If shutdown was requested, do emergency save for any profiles still running
     if shutdown_requested:
         await emergency_save_all()
     
@@ -483,7 +614,7 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
 # ---------------------------------------------------------------------------
 # DAILY SCHEDULER
 # ---------------------------------------------------------------------------
-def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=15, region=None, strike_keyword=None, strike_channel=None, strike_window=2.0, fast_mode=False):
+def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True, warm_day=15, concurrency=15, region=None, strike_keyword=None, strike_channel=None, strike_window=2.0, fast_mode=False, skip_recent_hours=0):
     run_time = os.getenv("SCHEDULE_TIME", "09:00").strip()
     log.info(f"📅 Scheduler active — Daily target: {run_time} | Region: {region or 'GLOBAL'}")
     
@@ -501,7 +632,7 @@ def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wand
         log.info(f"⏰ Next run: {actual_target.strftime('%H:%M:%S')} (in {wait/3600:.1f}h)")
         time.sleep(max(wait, 0))
         
-        asyncio.run(run_all(selected_ids, run_google, run_youtube, run_wander, current_day, max_concurrent=concurrency, region=region, strike_keyword=strike_keyword, strike_channel=strike_channel, strike_window=strike_window, fast_mode=fast_mode))
+        asyncio.run(run_all(selected_ids, run_google, run_youtube, run_wander, current_day, max_concurrent=concurrency, region=region, strike_keyword=strike_keyword, strike_channel=strike_channel, strike_window=strike_window, fast_mode=fast_mode, skip_recent_hours=skip_recent_hours))
         current_day += 1
 
 # ---------------------------------------------------------------------------
@@ -525,6 +656,9 @@ if __name__ == "__main__":
     parser.add_argument("--strike-window", type=float, default=2.0, help="Hours to organically spread the strike traffic across.")
     parser.add_argument("--fast", action="store_true", help="Fast mode: Google + YouTube only, ~8-10 min per profile instead of ~22 min")
     parser.add_argument("--browse-channel", action="store_true", help="Strike via channel browsing: bots visit channel page and pick videos organically")
+    
+    parser.add_argument("--skip-recent", type=int, default=0, metavar="HOURS",
+                        help="Skip profiles successfully warmed in the last N hours (default: 0, don't skip).")
 
     args = parser.parse_args()
 
@@ -537,7 +671,6 @@ if __name__ == "__main__":
         log.error("❌ Strike Mission Error: You must provide BOTH --strike-keyword and --strike-channel, or use --browse-channel with --strike-channel.")
         exit(1)
     
-    # For browse-channel mode, set a dummy keyword so the strike module uses channel browsing
     strike_kw = args.strike_keyword
     if args.browse_channel and args.strike_channel and not strike_kw:
         strike_kw = ["__browse_channel__"]
@@ -551,7 +684,7 @@ if __name__ == "__main__":
         if strike_kw:
             log.info(f"Dry-run Strike Active: Targeting {strike_kw} on channel '{args.strike_channel}' over {args.strike_window} hours.")
     elif args.schedule:
-        run_scheduler(args.profile, g, y, w, args.day, args.concurrency, args.region, strike_kw, args.strike_channel, args.strike_window, fast_mode=args.fast)
+        run_scheduler(args.profile, g, y, w, args.day, args.concurrency, args.region, strike_kw, args.strike_channel, args.strike_window, fast_mode=args.fast, skip_recent_hours=args.skip_recent)
     else:
         # NOTE: Do NOT use WindowsSelectorEventLoopPolicy — it breaks Playwright
-        asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency, region=args.region, strike_keyword=strike_kw, strike_channel=args.strike_channel, strike_window=args.strike_window, fast_mode=args.fast))
+        asyncio.run(run_all(args.profile, g, y, w, args.day, max_concurrent=args.concurrency, region=args.region, strike_keyword=strike_kw, strike_channel=args.strike_channel, strike_window=args.strike_window, fast_mode=args.fast, skip_recent_hours=args.skip_recent))

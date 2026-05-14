@@ -1,21 +1,28 @@
 """
-refresh_proxies_safely.py  [v3 — MLX-first ordering, correct field names]
+refresh_proxies_safely.py  [v4 — username field corrected]
 --------------------------
-KEY FIXES from v2:
-  1. MLX is updated BEFORE Supabase (prevents DB-MLX drift if MLX fails)
-  2. Field name is 'profile_id' not 'id' (verified by 400 error from MLX)
-  3. SSL retry built in for transient TLS errors
+FIX from v3: changed proxy field 'login' to 'username'.
+Verified against:
+  1. Multilogin's official GitHub: github.com/multilogin/quick_profile_proxy
+  2. Multilogin docs at multilogin.com/help/updating-a-profile-with-postman
+  Both use 'username', NOT 'login'. Support gave incorrect info.
 
-API spec (corrected per actual MLX response):
-  Endpoint: POST https://api.multilogin.com/profile/partial_update
-  Body:    { "profile_id": "<mla_uuid>", "proxy": {"type": "http", "host": ..., "port": <int>, "login": ..., "password": ...} }
-  Auth:    Bearer token
-  Rate:    50 req/min on Custom plan -> 1.5s sleep
+Endpoint: POST https://api.multilogin.com/profile/partial_update
+Body:    {
+  "profile_id": "<mla_uuid>",
+  "proxy": {
+    "type": "http",
+    "host": "<ip>",
+    "port": <int>,
+    "username": "<user>",
+    "password": "<pass>"
+  }
+}
 
 Order of operations per profile:
   1. POST to MLX
   2. If MLX succeeds, UPDATE Supabase
-  3. If MLX fails, SKIP Supabase (don't create drift)
+  3. If MLX fails, SKIP Supabase (prevents DB/MLX drift)
 
 Usage:
   python refresh_proxies_safely.py --only PR-0011 --dry-run
@@ -126,8 +133,10 @@ def assign_proxies_to_profiles(profiles: list, proxies: list) -> list:
 def update_mlx(token, assignment, dry_run=False):
     """
     POST https://api.multilogin.com/profile/partial_update
-    Body uses 'profile_id' (NOT 'id'), confirmed by MLX 400 response:
-      {"error_code":"BAD_REQUEST_BODY","message":"key 'profile_id' is required"}
+
+    Body field names verified against Multilogin's own GitHub:
+      github.com/multilogin/quick_profile_proxy/blob/main/main.py
+    Uses 'profile_id' for ID and 'username' for proxy auth (NOT 'id' or 'login').
     """
     profile = assignment["profile"]
     proxy = assignment["proxy"]
@@ -143,12 +152,12 @@ def update_mlx(token, assignment, dry_run=False):
         "Authorization": f"Bearer {token}",
     }
     body = {
-        "profile_id": mla_uuid,   # CORRECT field name
+        "profile_id": mla_uuid,
         "proxy": {
             "type": PROXY_TYPE,
             "host": proxy["host"],
             "port": proxy["port"],
-            "login": PROXY_USER,
+            "username": PROXY_USER,   # <- CORRECT field name (not 'login')
             "password": PROXY_PASS,
         }
     }
@@ -269,7 +278,6 @@ def main():
         if not args.skip_mlx:
             ok, msg, err_code = update_mlx(mlx_token, assignment, dry_run=args.dry_run)
 
-            # Auto token refresh on 401
             if not ok and err_code == "AUTH" and token_refresh_count < 3:
                 log.info("    Refreshing MLX token...")
                 mlx_token = get_mlx_token()
@@ -287,9 +295,9 @@ def main():
                 log.warning(f"{progress} ERR {msg}")
                 failed.append(profile_name)
         else:
-            mlx_succeeded = True  # skip-mlx means treat as success for DB step
+            mlx_succeeded = True
 
-        # Step 2: DB only if MLX succeeded (prevents drift)
+        # Step 2: DB only if MLX succeeded
         if not args.skip_db:
             if mlx_succeeded:
                 ok, msg = update_supabase(supabase, assignment, dry_run=args.dry_run)
@@ -305,7 +313,6 @@ def main():
                 db_skipped += 1
                 log.info(f"{progress} -- DB skipped (MLX failed): {profile_name}")
 
-        # Rate limit pause
         if not args.dry_run and not args.skip_mlx:
             time.sleep(MLX_RATE_LIMIT_SLEEP)
 

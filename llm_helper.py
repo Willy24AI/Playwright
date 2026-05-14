@@ -5,22 +5,86 @@ Handles dynamic generation of search terms, documents, and comments using OpenAI
 
 [FIXED]:
 - Uses profile interests directly (from demographics.interests) as PRIMARY search source
-- OpenAI is an ENHANCEMENT, not a dependency — if it fails, interests are used directly
+- OpenAI is an ENHANCEMENT, not a dependency - if it fails, interests are used directly
 - Reads location from the correct field path (persona.location or profile.location)
 - No more "interesting videos" fallback spam
 - Adds natural variation to interest-based searches without needing LLM
+
+[v2 PATCH - resilient fallbacks]:
+- Direct News Domain: instead of falling back to amazon.com, picks from a curated
+  pool of mid-tier news sites that historically accept proxy traffic
+- Shopping Target: same pool-based approach, avoiding Amazon
+- Shopping Query: pulls from interests instead of generic "buy X"
+- LLM errors logged at DEBUG (no log spam when LLM is down)
+- Clean SSL context attempted for OpenAI (with graceful fallback if it fails)
 """
 
 import os
+import ssl
 import logging
 import random
 import re
+
+import httpx
+import certifi
 from openai import AsyncOpenAI
 
 log = logging.getLogger(__name__)
 
-# Initialize the async client
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ---------------------------------------------------------------------------
+# OPENAI CLIENT INIT - tries to build a clean SSL context, but if that fails
+# at runtime (e.g., truststore corruption), the LLM calls will gracefully
+# fall back to interest-based generation. Either way, the system keeps working.
+# ---------------------------------------------------------------------------
+try:
+    _openai_ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    _openai_http_client = httpx.AsyncClient(
+        verify=_openai_ssl_ctx,
+        timeout=httpx.Timeout(15.0, connect=8.0),
+    )
+    client = AsyncOpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        http_client=_openai_http_client,
+    )
+except Exception as e:
+    log.warning(f"OpenAI client init issue, using default: {e}")
+    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+# ---------------------------------------------------------------------------
+# SAFE FALLBACK POOLS - curated lists of sites that historically work through
+# proxies. Used when LLM fails or as additional variety. Excludes known-blocked
+# sites (Amazon, Best Buy, BBC, CNN, Reddit at certain edge nodes).
+# ---------------------------------------------------------------------------
+
+SAFE_NEWS_DOMAINS = [
+    # Mid-tier general news (good proxy compatibility)
+    "npr.org", "theatlantic.com", "politico.com", "axios.com",
+    "thehill.com", "vox.com", "slate.com", "huffpost.com",
+    "propublica.org", "yahoo.com", "nypost.com",
+    # International (different CDN reputation)
+    "aljazeera.com", "france24.com", "dw.com",
+    # Tech/business (often less blocked)
+    "techcrunch.com", "theverge.com", "arstechnica.com",
+    "engadget.com", "fastcompany.com", "wired.com",
+    # Lifestyle / general
+    "atlasobscura.com", "mentalfloss.com", "smithsonianmag.com",
+    "nationalgeographic.com", "popsci.com",
+]
+
+SAFE_SHOPPING_DOMAINS = [
+    # Alternatives to Amazon/BestBuy (usually accept proxies)
+    "etsy.com", "ebay.com", "walmart.com", "target.com",
+    "wayfair.com", "homedepot.com", "lowes.com", "overstock.com",
+    "newegg.com", "rei.com", "zappos.com", "nordstrom.com",
+    "macys.com", "kohls.com", "thriftbooks.com",
+]
+
+GENERIC_SAFE_SITES = [
+    "britannica.com", "wikipedia.org", "github.com",
+    "stackoverflow.com", "medium.com", "imdb.com",
+    "yelp.com", "goodreads.com", "meetup.com",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -31,38 +95,35 @@ def _get_profile_interests(profile: dict) -> list:
     """Extract interests from profile, checking all possible field locations."""
     interests = []
     
-    # Check persona.interests (set by profiles_config.py mapper)
     persona = profile.get("persona", {})
     if isinstance(persona, dict):
         interests = persona.get("interests", [])
     
-    # Fallback: check demographics.interests directly
     if not interests:
         demographics = profile.get("demographics", {})
         if isinstance(demographics, dict):
             interests = demographics.get("interests", [])
     
-    # Fallback: check top-level topics
     if not interests:
         interests = profile.get("topics", [])
     
     return interests if interests else []
 
+
 def _get_profile_location(profile: dict) -> dict:
     """Extract location from profile, checking all possible field locations."""
-    # Check persona.location (set by profiles_config.py mapper)
     persona = profile.get("persona", {})
     if isinstance(persona, dict):
         loc = persona.get("location", {})
         if loc and loc.get("city"):
             return loc
     
-    # Fallback: check top-level location
     loc = profile.get("location", {})
     if isinstance(loc, dict) and loc.get("city"):
         return loc
     
     return {}
+
 
 def _get_persona_info(profile: dict) -> dict:
     """Extract persona display info."""
@@ -77,37 +138,30 @@ def _get_persona_info(profile: dict) -> dict:
         "occupation": demographics.get("occupation", ""),
     }
 
+
 def _pick_interest_search(profile: dict) -> str:
-    """
-    Pick a search query directly from the profile's interests.
-    These are already great search queries like "Dallas esports tournaments 2023".
-    Adds slight natural variation.
-    """
+    """Pick a search query directly from the profile's interests."""
     interests = _get_profile_interests(profile)
     
     if not interests:
-        # Absolute last resort — generic but varied
         generic = [
             "trending videos today", "things to do this weekend",
-            "best new movies 2024", "cool tech gadgets", 
+            "best new movies 2024", "cool tech gadgets",
             "how to learn something new", "funny videos compilation",
             "life hacks everyone should know", "best podcasts right now",
             "what to watch on youtube", "interesting documentaries"
         ]
         return random.choice(generic)
     
-    # Pick a random interest
     query = random.choice(interests)
     
-    # 30% chance to add a natural modifier
     if random.random() < 0.30:
         modifiers = [
-            "", "reddit", "2024", "best", "how to", 
+            "", "reddit", "2024", "best", "how to",
             "near me", "tutorial", "explained", "review", "tips"
         ]
         mod = random.choice(modifiers)
         if mod:
-            # Sometimes prepend, sometimes append
             if random.random() < 0.5:
                 query = f"{mod} {query}"
             else:
@@ -117,7 +171,7 @@ def _pick_interest_search(profile: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LLM-ENHANCED SEARCH (OPTIONAL — FALLS BACK TO INTERESTS)
+# LLM-ENHANCED SEARCH (OPTIONAL - FALLS BACK TO SAFE POOLS)
 # ---------------------------------------------------------------------------
 
 async def _safe_generate(system_prompt: str, user_prompt: str, token_limit: int, temp: float) -> str:
@@ -129,23 +183,23 @@ async def _safe_generate(system_prompt: str, user_prompt: str, token_limit: int,
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=temp, 
+            temperature=temp,
             max_tokens=token_limit,
-            presence_penalty=0.6, 
+            presence_penalty=0.6,
             frequency_penalty=0.3,
-            timeout=10  # Don't hang forever
+            timeout=10
         )
         
         output = response.choices[0].message.content.strip()
-        
-        # Aggressive Sanitization
         output = output.strip('\'"*.')
         output = re.sub(r"^(here is|sure,?|the domain is|query:)\s*", "", output, flags=re.IGNORECASE).strip()
         
         return output
         
     except Exception as e:
-        log.warning(f"    ⚠️ LLM generation failed: {e}")
+        # Demote to debug - log spam is annoying when LLM is intermittently down.
+        # The fallback pools cover the gap.
+        log.debug(f"LLM generation failed (using fallback): {e}")
         return ""
 
 
@@ -154,18 +208,16 @@ async def generate_dynamic_search(profile: dict, platform: str) -> str:
     Generate a search query for the given platform.
     
     Strategy:
-    1. Try OpenAI for a creative, varied query (50% of the time)
-    2. If OpenAI fails OR 50% of the time, use profile interests directly
-    3. Profile interests are already excellent localized queries
+    1. Try OpenAI for creative variation
+    2. If OpenAI fails, use platform-appropriate fallback from SAFE pools
+    3. Final fallback: profile interests (always works, often great)
     """
     interests = _get_profile_interests(profile)
     info = _get_persona_info(profile)
     location = _get_profile_location(profile)
     
-    # Pick a focus topic from interests
     focus_topic = random.choice(interests) if interests else "interesting videos"
     
-    # Build context for LLM
     city = location.get("city", "a city")
     state = location.get("state", "")
     name = info.get("name", "a user")
@@ -178,7 +230,6 @@ async def generate_dynamic_search(profile: dict, platform: str) -> str:
         f"My current interest: '{focus_topic}'."
     )
 
-    # Base System Prompt
     base_system = (
         "You are the internal thought process of a human web user. "
         "CRITICAL RULE: Never explain yourself. Never use conversational filler like 'Sure' or 'Here is'. "
@@ -186,52 +237,85 @@ async def generate_dynamic_search(profile: dict, platform: str) -> str:
     )
 
     # --- PLATFORM-SPECIFIC GENERATION ---
-    
+
     if platform == "Google Docs Draft":
         system_prompt = base_system + " Write a realistic, 3-to-4 sentence paragraph about the user's interest. Do NOT use hashtags, emojis, or titles."
         output = await _safe_generate(system_prompt, user_prompt, 150, 0.85)
-        return output or "Project outline: Needs more research and formatting before finalizing."
+        return output or f"Notes on {focus_topic}: needs more research before finalizing. Will follow up next week."
 
     elif platform == "Google Calendar Event":
-        system_prompt = base_system + " Write exactly ONE short, highly realistic calendar event title (2 to 6 words). Examples: Zoom call about X, Read up on X."
+        system_prompt = base_system + " Write exactly ONE short, highly realistic calendar event title (2 to 6 words)."
         output = await _safe_generate(system_prompt, user_prompt, 15, 0.80)
-        return output or "Review project notes"
+        return output or f"Review {focus_topic} notes"
 
     elif platform == "Google News":
         system_prompt = base_system + " Generate ONE short, specific search query for the Google News search bar. Keep it lowercase."
         output = await _safe_generate(system_prompt, user_prompt, 20, 0.90)
         return output or focus_topic
 
-    elif platform in ["Shopping Target", "OAuth Target", "Direct News Domain"]:
+    elif platform == "Direct News Domain":
+        # PATCHED: instead of falling back to amazon.com, pick a safe news site
         system_prompt = base_system + (
-            " Identify a popular, high-authority website for this interest. "
-            "STRICT RULES: Return ONLY the raw domain name (e.g., 'amazon.com', 'pinterest.com', 'theverge.com'). "
-            "Do NOT include https:// or www."
+            " Identify a popular news or publisher website for this interest. "
+            "STRICT RULES: Return ONLY the raw domain name (e.g., 'theverge.com', 'npr.org'). "
+            "Do NOT include https:// or www. Do NOT pick Amazon, Best Buy, or BBC."
+        )
+        output = await _safe_generate(system_prompt, user_prompt, 15, 0.7)
+        output = output.lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0] if output else ""
+        # Validate it's not on the known-blocked list
+        blocked = {"amazon.com", "bestbuy.com", "bbc.com", "cnn.com", "reddit.com"}
+        if output and output not in blocked and "." in output:
+            return output
+        return random.choice(SAFE_NEWS_DOMAINS)
+
+    elif platform == "Shopping Target":
+        # PATCHED: avoid Amazon/BestBuy on fallback
+        system_prompt = base_system + (
+            " Identify a popular shopping website for this interest. "
+            "STRICT RULES: Return ONLY the raw domain name. "
+            "Do NOT include https:// or www. Avoid Amazon."
+        )
+        output = await _safe_generate(system_prompt, user_prompt, 15, 0.7)
+        output = output.lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0] if output else ""
+        blocked = {"amazon.com", "bestbuy.com"}
+        if output and output not in blocked and "." in output:
+            return output
+        return random.choice(SAFE_SHOPPING_DOMAINS)
+
+    elif platform == "OAuth Target":
+        system_prompt = base_system + (
+            " Identify a popular website that supports Google sign-in. "
+            "STRICT RULES: Return ONLY the raw domain name."
         )
         output = await _safe_generate(system_prompt, user_prompt, 15, 0.5)
-        output = output.lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
-        return output or "amazon.com"
+        output = output.lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0] if output else ""
+        return output if (output and "." in output) else random.choice(GENERIC_SAFE_SITES)
 
     elif platform == "Shopping Query":
-        system_prompt = base_system + " Generate ONE specific commercial search query for a high-end product you would buy related to this interest. Example: 'sony a7iv price'."
+        system_prompt = base_system + " Generate ONE specific commercial search query for a high-end product related to this interest. Example: 'sony a7iv price'."
         output = await _safe_generate(system_prompt, user_prompt, 20, 0.85)
-        return output or f"buy {focus_topic}"
+        # PATCHED: use interest-based fallback instead of generic "buy X"
+        if output:
+            return output
+        if interests:
+            interest = random.choice(interests)
+            templates = [f"buy {interest}", f"best {interest} 2024", f"{interest} review", f"{interest} price"]
+            return random.choice(templates)
+        return "best gift ideas 2024"
 
     elif platform == "Drive Folder":
-        system_prompt = base_system + " Generate ONE short, casual name for a personal Google Drive folder related to this interest. Sometimes use lowercase."
+        system_prompt = base_system + " Generate ONE short, casual name for a personal Google Drive folder related to this interest."
         output = await _safe_generate(system_prompt, user_prompt, 15, 0.85)
-        return output or "references"
+        return output or random.choice([f"{focus_topic} notes", "references", "drafts", "work stuff", "ideas"])
 
     else:
         # --- STANDARD SEARCH (YouTube, Google, etc.) ---
-        # 50% chance: use LLM for creative variation
-        # 50% chance: use profile interests directly (already great queries)
         use_llm = random.random() < 0.50 and interests
         
         if use_llm:
             intents = [
-                "troubleshoot a specific problem", "find a beginner tutorial", 
-                "find entertaining long-form content", "buy something cheap", 
+                "troubleshoot a specific problem", "find a beginner tutorial",
+                "find entertaining long-form content", "buy something cheap",
                 "find the latest drama/news", "find an obscure weird fact"
             ]
             intent = random.choice(intents)
@@ -244,7 +328,6 @@ async def generate_dynamic_search(profile: dict, platform: str) -> str:
             if output:
                 return output
         
-        # Direct interest-based search (no LLM needed — these are already perfect)
         return _pick_interest_search(profile)
 
 
@@ -272,9 +355,7 @@ async def generate_contextual_comment(profile: dict, video_title: str, video_des
         "DO NOT use quotes or hashtags. Output ONLY the raw comment text."
     )
     
-    user_prompt = (
-        f"I am {info['name']}, "
-    )
+    user_prompt = f"I am {info['name']}, "
     occupation = info.get("occupation", "")
     if occupation:
         user_prompt += f"a {occupation} "
@@ -292,7 +373,7 @@ async def generate_contextual_comment(profile: dict, video_title: str, video_des
         return output
     else:
         fallbacks = [
-            "this is actually crazy tbh", "saving this for later", 
+            "this is actually crazy tbh", "saving this for later",
             "i needed this today lol", "wait is this actually real?",
             "bro this is exactly what i was looking for",
             "why did it take me so long to find this",

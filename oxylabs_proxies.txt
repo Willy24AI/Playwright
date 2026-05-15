@@ -2,3 +2,4 @@ disp.oxylabs.io:8002:user-oxyen_MEj9h:=qV18RED5mMrG=4
 disp.oxylabs.io:8003:user-oxyen_MEj9h:=qV18RED5mMrG=4
 disp.oxylabs.io:8004:user-oxyen_MEj9h:=qV18RED5mMrG=4
 disp.oxylabs.io:8005:user-oxyen_MEj9h:=qV18RED5mMrG=4
+disp.oxylabs.io:8001:user-oxyen_MEj9h:=qV18RED5mMrG=4

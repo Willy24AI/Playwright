@@ -5,10 +5,13 @@ Nexus Enterprise Farm Orchestrator.
 Complete production-ready brain for browser warming and targeted strikes.
 
 [PATCHED for Google ASN block]:
-  - Added --no-google flag to skip ALL Google-family tasks
-  - Replaces them with more wander/news/shopping/newsletter
+  - Added --no-google flag to skip ALL Google-family tasks (google, youtube,
+    gmail, maps, calendar, drive, workspace, oauth)
+  - Replaces them with more wander/news/shopping/newsletter for non-Google warming
+  - Useful when your proxy ASN is blocked by Google and you still need to keep
+    profiles "alive" by generating non-Google activity
 
-[UPGRADED]:
+[UPGRADED]: 
 - Resilient Task Execution
 - Playwright CDP Retry Matrix
 - Database Bloat Protection (Free-Tier Safe)
@@ -16,17 +19,11 @@ Complete production-ready brain for browser warming and targeted strikes.
 
 [PATCHED] First-navigation proxy-retry:
   MLX opens the DevTools port slightly BEFORE the proxy credentials are
-  fully wired into the browser. goto_with_proxy_retry() retries the first
+  fully wired into the browser. The first page.goto of a session can fail
+  with ERR_INVALID_AUTH_CREDENTIALS (or hang to a timeout) even though the
+  proxy config is correct. goto_with_proxy_retry() retries the first
   navigation with backoff so a not-ready proxy no longer kills the task.
-
-[v2 pre-flight — patient first probe]:
-  MLX's proxy auth extension can take 30+ seconds to fully inject into
-  a freshly-launched browser. Previously we declared the proxy dead on
-  the first failure. Now the very first probe URL gets 3 attempts with
-  5s/10s backoff before we move on or give up, because the first request
-  through a not-yet-warm proxy will look exactly like an auth rejection.
-  Subsequent probe URLs still fail-fast since by then the extension
-  should have loaded.
+  Pair with PROXY_WARMUP_DELAY=20 in mlx_api.py.
 """
 
 import asyncio
@@ -53,7 +50,7 @@ from auth import get_token
 from mlx_api import start_profile, stop_profile
 from profiles_config import fetch_active_profiles, update_last_run, update_profile_status
 from behavior_engine import (
-    human_type, human_scroll, click_humanly, idle_reading,
+    human_type, human_scroll, click_humanly, idle_reading, 
     smart_wait, lognormal_delay, move_mouse_humanly
 )
 
@@ -96,23 +93,13 @@ PROXY_ERROR_SIGNATURES = (
     "ERR_HTTPS_PROXY_TUNNEL_RESPONSE_REDIRECT",
 )
 
-# Hard-fail signatures used AFTER the patient first probe. By the time we
-# reach the second probe URL, MLX's auth extension should have loaded —
-# if it still says ERR_INVALID_AUTH_CREDENTIALS, the proxy is genuinely dead.
-PROXY_HARD_FAIL_SIGNATURES = (
-    "ERR_INVALID_AUTH_CREDENTIALS",
-    "ERR_PROXY_AUTH_REQUESTED",
-    "ERR_PROXY_AUTH_UNSUPPORTED",
-)
-
 def is_proxy_error(error_msg: str) -> bool:
     return any(sig in error_msg for sig in PROXY_ERROR_SIGNATURES)
 
-def is_proxy_hard_fail(error_msg: str) -> bool:
-    return any(sig in error_msg for sig in PROXY_HARD_FAIL_SIGNATURES)
-
 
 # Errors that indicate the proxy simply isn't ready yet (vs. a genuine fault).
+# Superset of is_proxy_error() — also includes timeouts, because a slow first
+# load through a not-yet-wired proxy surfaces as a timeout, not an auth error.
 _PROXY_NOT_READY_HINTS = PROXY_ERROR_SIGNATURES + ("ERR_TIMED_OUT", "Timeout")
 
 
@@ -121,6 +108,9 @@ async def goto_with_proxy_retry(page, url: str, pid: str = "", attempts: int = 5
     First-navigation helper: retries past a proxy that MLX hasn't finished
     wiring up. Only retries on proxy-flavored errors (auth/connection/timeout);
     a genuine error is re-raised immediately so it isn't masked.
+
+    On a truly dead proxy this spends ~50s exhausting retries before giving up
+    — acceptable for small runs; revisit if scaling up to many profiles.
     """
     last_err = None
     for i in range(attempts):
@@ -139,80 +129,6 @@ async def goto_with_proxy_retry(page, url: str, pid: str = "", attempts: int = 5
                 log.warning(f"    ⏳ Proxy not ready ({msg[:50]}...) — retry in {wait}s ({i+1}/{attempts})")
             await asyncio.sleep(wait)
     raise last_err
-
-
-async def preflight_proxy_check(context, pid: str, timeout_ms: int = 8000) -> bool:
-    """
-    A proxy must respond — but the FIRST probe gets retry tolerance because
-    MLX's proxy auth extension is often still loading at this point.
-
-    Strategy:
-      - First probe URL: 3 attempts with 5s/10s backoff. The very first
-        request through a fresh proxy often hits the extension before it
-        has finished registering credentials. We give it room.
-      - Subsequent probe URLs: single attempt, hard-fail on auth errors.
-        By the time we get here, the extension should have loaded; if it
-        STILL rejects auth, the proxy is genuinely dead.
-      - All probes exhausted = dead proxy, skip the profile.
-    """
-    probe_urls = [
-        "https://api.ipify.org?format=text",
-        "https://icanhazip.com",
-        "https://httpbin.org/ip",
-    ]
-
-    test_page = None
-    try:
-        test_page = await context.new_page()
-
-        # === First probe: be patient — extension may still be loading ===
-        first_url = probe_urls[0]
-        first_passed = False
-        for attempt in range(3):
-            try:
-                await test_page.goto(first_url, wait_until="domcontentloaded", timeout=timeout_ms)
-                plog(pid, f"✅ Proxy alive (responded on attempt {attempt+1} to {first_url.split('//')[1][:25]})")
-                return True
-            except Exception as e:
-                err = str(e)
-                if attempt < 2:
-                    wait = 5 + attempt * 5  # 5s, then 10s
-                    plog(pid, f"⏳ First probe failed ({err[:60]}) — extension may still be loading, retry in {wait}s")
-                    await asyncio.sleep(wait)
-                else:
-                    plog(pid, f"⚠️ First probe exhausted 3 retries: {err[:60]}")
-
-        # === Subsequent probes: single attempt, fail-fast on auth errors ===
-        # If we got here, the first URL failed 3 times. Try alternates once each
-        # in case it was just that one probe URL having issues. But by now the
-        # auth extension should be loaded, so a hard-fail is a real hard-fail.
-        for url in probe_urls[1:]:
-            try:
-                await test_page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                plog(pid, f"✅ Proxy alive (clean response from {url.split('//')[1][:25]})")
-                return True
-            except Exception as e:
-                err = str(e)
-                if is_proxy_hard_fail(err):
-                    plog(pid, f"❌ Proxy auth rejected on {url.split('//')[1][:25]} (after extension warmup) — skipping profile")
-                    return False
-                if "ERR_PROXY" in err or "ERR_TUNNEL" in err:
-                    plog(pid, f"❌ Proxy connection failed ({err[:60]}) — skipping profile")
-                    return False
-                plog(pid, f"⚠️ Probe {url.split('//')[1][:25]} failed ({err[:50]}), trying next...")
-                continue
-
-        plog(pid, "❌ All probes exhausted — proxy is unreliable, skipping")
-        return False
-    except Exception as e:
-        plog(pid, f"⚠️ Pre-flight crashed: {str(e)[:80]}")
-        return False
-    finally:
-        if test_page:
-            try:
-                await test_page.close()
-            except Exception:
-                pass
 
 
 shutdown_requested = False
@@ -284,6 +200,7 @@ async def verify_profile_stopped(profile_uuid: str, token: str, pid: str, max_re
 async def probe_proxy_recovery(page, pid: str, wait_seconds: int = 10) -> bool:
     plog(pid, f"⏳ Waiting {wait_seconds}s for proxy to recover...")
     await asyncio.sleep(wait_seconds)
+    # Non-Google probe URLs since Google may be blocked but proxy is alive
     probe_urls = [
         "https://example.com",
         "https://httpbin.org/status/200",
@@ -333,6 +250,7 @@ async def google_session(page, profile: dict):
     behavior = profile.get("behavior", {})
     topic = await generate_dynamic_search(profile, platform="Google Search")
     plog(pid, f"🔍 Google: '{topic}'")
+    # First navigation — retry past a proxy that MLX hasn't finished wiring up.
     await goto_with_proxy_retry(page, "https://www.google.com", pid=pid)
     await smart_wait(page)
     await handle_consent(page, pid)
@@ -451,37 +369,21 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
         })
 
         # ============================================================
-        # PRE-FLIGHT PROXY CHECK — patient first probe, strict thereafter
-        # ============================================================
-        proxy_alive = await preflight_proxy_check(context, pid, timeout_ms=8000)
-        if not proxy_alive:
-            plog(pid, "❌ Proxy did not pass pre-flight — skipping profile")
-            update_profile_status(pid, status="PROXY_ERROR", error_msg="Pre-flight proxy check failed")
-            try: await page.close()
-            except Exception: pass
-            try: await context.close()
-            except Exception: pass
-            try: await browser.close()
-            except Exception: pass
-            await asyncio.sleep(1)
-            await loop.run_in_executor(None, stop_profile, profile_id, token)
-            await verify_profile_stopped(profile_id, token, pid)
-            await unregister_running_profile(profile_id)
-            return
-
-        # ============================================================
         # BUILD SESSION LIST
         # ============================================================
         sessions = []
 
         if no_google:
+            # Google ASN is blocked — skip everything Google-touching
             plog(pid, "🚫 --no-google mode: skipping Google/YouTube/Gmail/Maps/etc")
             if fast_mode:
+                # Fast: 2 quick safe tasks
                 safe_pool = ["wander", "news", "shopping"]
                 random.shuffle(safe_pool)
                 sessions = safe_pool[:2]
                 plog(pid, f"⚡ Fast mode: 2 non-Google sessions ({', '.join(sessions)})")
             else:
+                # Full: lots of safe tasks for variety
                 if run_wander: sessions.append("wander")
                 if random.random() < 0.30: sessions.append("newsletter")
                 if random.random() < 0.40: sessions.append("news")
@@ -489,6 +391,7 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
                 if random.random() < 0.30: sessions.append("wander")
                 plog(pid, f"🔄 Full mode: {len(sessions)} non-Google sessions")
         else:
+            # Original behavior — Google tasks allowed
             if strike_keyword and strike_channel:
                 sessions.append("youtube_strike")
                 plog(pid, f"🎯 STRIKE MISSION Queued: {strike_keyword} -> {strike_channel}")
@@ -512,6 +415,8 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
 
         random.shuffle(sessions)
 
+        # Safety: if no_google and sessions ended up empty (e.g., all random rolls failed),
+        # at least do one wander so the profile launches and saves cookies
         if not sessions:
             sessions = ["wander"]
             plog(pid, "⚠️ No tasks selected — defaulting to single wander session")

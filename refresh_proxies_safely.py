@@ -62,9 +62,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ===== CONFIG =====
-PROXY_FILE = "webshare_proxies_NEW.txt"
-PROXY_USER = "bozvesah"
-PROXY_PASS = "e5n7zbamrk1z"
+PROXY_FILE = "oxylabs_proxies.txt"
+PROXY_USER = "user-oxyen_MEj9h"
+PROXY_PASS = "=qV18RED5mMrG=4"
 PROXY_TYPE = "http"
 
 MLX_API_BASE = "https://api.multilogin.com"
@@ -231,7 +231,7 @@ def main():
         log.info("DRY RUN MODE - no changes will be made")
 
     proxies = load_new_proxies()
-    if len(proxies) < 10:
+    if len(proxies) < 5:
         log.error(f"Only {len(proxies)} proxies. Aborting - looks wrong.")
         sys.exit(1)
 

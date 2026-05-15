@@ -10,6 +10,21 @@ Starts and stops Multilogin profiles.
   - Thread-safe token refresh coalescing (lives in auth.py).
   - Proxy-dead path (GET_DIRECT_CONNECTION_IP_ERROR) raises immediately.
   - On 401, calls auth.get_token(force=True) which is coalesced.
+
+[v4 — automation type configurable]:
+  - MLX_AUTOMATION_TYPE env var (default 'playwright') selects how MLX
+    launches the browser. Use 'playwright' for CDP attach. 'selenium'
+    exposes WebDriver instead — Playwright cannot connect to that.
+  - If you ever need to bypass proxy auth issues at the MLX layer,
+    override this in .env without editing code.
+
+[v5 — extended proxy warmup]:
+  - PROXY_WARMUP_DELAY raised from 20s to 30s.
+  - MLX's proxy auth extension needs time to fully inject credentials
+    into the freshly-launched browser. 20s wasn't enough on slower
+    machines; 30s gives the extension enough headroom that the first
+    Playwright navigation through the proxy succeeds cleanly.
+  - Can be overridden via MLX_PROXY_WARMUP_DELAY env var if needed.
 """
 
 import logging
@@ -39,7 +54,18 @@ log = logging.getLogger(__name__)
 
 LOCAL_AGENT = "https://launcher.mlx.yt:45001"
 MAX_BOOT_WAIT = 30
-PROXY_WARMUP_DELAY = 3
+
+# Proxy warmup: how long to wait AFTER the MLX port is open before handing
+# off to Playwright. The extension that injects proxy credentials needs
+# this time to attach to the browser; if Playwright navigates too soon,
+# the first request fails with ERR_INVALID_AUTH_CREDENTIALS.
+PROXY_WARMUP_DELAY = int(os.getenv("MLX_PROXY_WARMUP_DELAY", "30"))
+
+# Automation type for MLX launch. 'playwright' exposes a CDP endpoint
+# (which is what our connect_over_cdp call expects). 'selenium' exposes
+# a WebDriver endpoint instead — Playwright cannot attach to that, so
+# leave this as 'playwright' unless you know exactly why you're changing it.
+_AUTOMATION_TYPE = os.getenv("MLX_AUTOMATION_TYPE", "playwright").strip().lower()
 
 # ---- Launch throttle --------------------------------------------------------
 # Multilogin's cloud auth endpoint doesn't tolerate burst traffic well.
@@ -94,10 +120,10 @@ def _start_profile_inner(profile_id: str, token: str, folder_id: str) -> str:
 
     start_url = (
         f"{LOCAL_AGENT}/api/v2/profile/f/{folder_id}/p/{profile_id}"
-        f"/start?automation_type=playwright&headless_mode=false"
+        f"/start?automation_type={_AUTOMATION_TYPE}&headless_mode=false"
     )
 
-    log.info(f"    ▶ [{profile_id[:8]}] Requesting MLX Profile Launch...")
+    log.info(f"    ▶ [{profile_id[:8]}] Requesting MLX Profile Launch (mode={_AUTOMATION_TYPE})...")
 
     refreshed_once = False  # only refresh the token ONCE per start_profile call
 

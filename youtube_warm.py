@@ -7,6 +7,14 @@ Upgraded with:
 - Retention Spike Simulation (Random rewinds during warming)
 - Better Ad-Revenue simulation (The 'Investor' delay)
 - Fitts's Law physics for UI interactions.
+
+[PATCHED] First-navigation proxy-retry:
+  MLX opens the DevTools port slightly BEFORE the proxy credentials are
+  fully wired into the browser. The very first page.goto can therefore
+  fail with ERR_INVALID_AUTH_CREDENTIALS (or hang to a timeout) even
+  though the proxy config is correct. goto_with_proxy_retry() retries
+  the first navigation with backoff so a not-ready proxy no longer
+  kills the whole session. Pair with PROXY_WARMUP_DELAY=20 in mlx_api.py.
 """
 
 import asyncio
@@ -27,6 +35,49 @@ from behavior_engine import (
 from llm_helper import generate_dynamic_search, generate_contextual_comment
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Proxy-warmup race protection
+# ---------------------------------------------------------------------------
+# The proxy may not be fully wired up the instant MLX hands off the browser.
+# Retry the FIRST navigation with backoff so a not-ready proxy doesn't kill
+# the whole session.
+PROXY_ERROR_HINTS = (
+    "ERR_INVALID_AUTH_CREDENTIALS",
+    "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_PROXY_AUTH_REQUESTED",
+    "ERR_PROXY_CERTIFICATE_INVALID",
+    "ERR_TIMED_OUT",
+    "Timeout",
+)
+
+
+async def goto_with_proxy_retry(page: Page, url: str, attempts: int = 5):
+    """
+    First-navigation helper: retries past a proxy that isn't ready yet.
+
+    Only retries on proxy-flavored errors (auth/connection/timeout). A genuine
+    error (bad selector, page crash, etc.) is re-raised immediately so it isn't
+    masked. On a truly dead proxy this will spend ~50s exhausting retries before
+    giving up — acceptable for small runs; revisit if scaling up.
+    """
+    last_err = None
+    for i in range(attempts):
+        try:
+            await page.goto(url, wait_until="domcontentloaded")
+            return True
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            if not any(h in msg for h in PROXY_ERROR_HINTS):
+                raise  # a real error, not the warmup race — don't mask it
+            wait = 4 + i * 3   # 4s, 7s, 10s, 13s, 16s
+            log.warning(f"    ⏳ Proxy not ready ({msg[:50]}...) — "
+                        f"retry in {wait}s ({i+1}/{attempts})")
+            await asyncio.sleep(wait)
+    raise last_err
+
 
 # Specific watch completion rates per persona to prevent uniform "bot-like" behavior
 WATCH_COMPLETION = {
@@ -179,7 +230,8 @@ async def youtube_warm_session(page: Page, profile: dict, behavior: dict, warm_d
     persona_name = profile.get("persona", {}).get("name", "UnknownBot")
     log.info(f"📺 [{persona_name}] Starting YouTube Warm session (Day {warm_day})...")
 
-    await page.goto("https://www.youtube.com", wait_until="domcontentloaded")
+    # First navigation — retry past a proxy that MLX hasn't finished wiring up.
+    await goto_with_proxy_retry(page, "https://www.youtube.com")
     await handle_youtube_consent(page, behavior)
     await smart_wait(page)
     

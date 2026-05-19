@@ -1,19 +1,29 @@
 """
 youtube_strike.py — production version
 
-[v5 — NEWEST-VIDEO MODE]:
-- video_pick_mode in route_channel_page: "random" | "newest" | "weighted"
-- 80/15/5 weighted-newest selection for organic spread
-
 [v5.1 — SEARCH BOX LOCATOR FIX]:
-- _nav_via_search and route_specific_video used a fallback selector list
-  to FIND the search box, but then hardcoded `input#search` for typing.
-  When the page used different markup (e.g. Finnish/Nordic homepage), the
-  find succeeded via fallback but the type-into-`input#search` hit a 60s
-  timeout because that exact selector didn't exist.
-- Fixed by introducing _type_into_locator() and _clear_locator() helpers
-  that work on the actual matched element returned by _first_visible_one.
-  No more hardcoded selectors after the find step.
+- _first_visible_one_with_selector(): keeps which selector matched
+- _clear_locator / _type_into_locator: typing helpers that work on a
+  locator (not a hardcoded `input#search`)
+- _nav_via_search and route_specific_video updated accordingly
+
+[v6 — SIDEBAR-DISCOVERY ROUTE]:
+- New route added for --latest-video runs: profile lands on the channel,
+  watches an OLDER video briefly, then clicks the target video from the
+  sidebar. This is the highest-signal path because it tells YouTube
+  "your algorithm already surfaces this video well; do more of it."
+- Three-way route split:
+    SEARCH_ROUTE_PROBABILITY        = 0.40
+    DIRECT_ROUTE_PROBABILITY        = 0.25
+    SIDEBAR_DISCOVERY_PROBABILITY   = 0.35
+- Sidebar route is only used when video_pick_mode is "newest" or
+  "weighted" (we need to know which video to look for in the sidebar).
+  For random channel-browse, it falls back to the old 75/25 split.
+- New helpers: route_via_sidebar_discovery, _get_channel_newest_id,
+  _find_target_in_sidebar.
+- If target isn't in the sidebar (~40-60% of the time), bot falls back
+  to "back to channel grid, click newest" — same outcome as before,
+  just with one extra channel-video watched first.
 """
 
 import asyncio
@@ -36,15 +46,32 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-SEARCH_ROUTE_PROBABILITY = 0.75
+# ---- ROUTE PROBABILITIES (must sum to 1.0) ----
+SEARCH_ROUTE_PROBABILITY        = 0.40
+DIRECT_ROUTE_PROBABILITY        = 0.25
+SIDEBAR_DISCOVERY_PROBABILITY   = 0.35
+# Sanity check at import-time so a future edit doesn't silently break things.
+assert abs((SEARCH_ROUTE_PROBABILITY + DIRECT_ROUTE_PROBABILITY +
+            SIDEBAR_DISCOVERY_PROBABILITY) - 1.0) < 0.001
 
+# ---- SOCIAL RATES (no maturation gates) ----
 LIKE_RATE = 0.08
 SUBSCRIBE_RATE = 0.02
 COMMENT_RATE = 0.015
 
 QUOTED_TITLE_PROBABILITY = 0.5
-
 WEIGHTED_NEWEST_WEIGHTS = [0.80, 0.15, 0.05]
+
+# ---- SIDEBAR-DISCOVERY tuning ----
+# How long to watch the "decoy" older video before clicking the target
+# from the sidebar. Short enough to be a quick browse, long enough to
+# register as a real session-start signal.
+SIDEBAR_DECOY_WATCH_RANGE = (30, 60)   # seconds
+# Which position on the channel grid to pull the decoy from. Avoid
+# position 1 because that IS the target in --latest-video mode.
+SIDEBAR_DECOY_POSITION_RANGE = (3, 8)
+# How many sidebar items to scan for the target before giving up.
+SIDEBAR_SCAN_LIMIT = 8
 
 HOMEPAGE_VIDEO_SELECTORS = [
     "ytd-rich-item-renderer ytd-thumbnail a#thumbnail",
@@ -70,15 +97,12 @@ CHANNEL_RESULT_SELECTORS = [
     "a.channel-link",
     "ytd-channel-renderer #main-link",
 ]
-# Order matters: try the most specific real-input selectors FIRST so we
-# don't lock onto a wrapper element that can't accept keyboard input.
 SEARCH_BOX_SELECTORS = [
     "input#search",
     "input[name='search_query']",
     "ytd-searchbox input",
     "ytd-masthead input#search",
     "#search-input input",
-    # Last-resort wrappers — only matched if the inputs above didn't exist
     "ytd-searchbox",
     "#search-input",
 ]
@@ -87,6 +111,13 @@ SEARCH_RESULT_VIDEO_SELECTORS = [
     "ytd-video-renderer a#thumbnail",
     "a#video-title[href*='/watch?v=']",
     "a[href*='/watch?v=']",
+]
+# Selectors for the recommendation sidebar on a /watch page.
+SIDEBAR_VIDEO_SELECTORS = [
+    "ytd-compact-video-renderer a#thumbnail",
+    "ytd-compact-video-renderer a.yt-simple-endpoint",
+    "yt-lockup-view-model a[href*='/watch?v=']",
+    "#secondary a[href*='/watch?v=']",
 ]
 
 GOOGLE_CHALLENGE_URL_HINTS = (
@@ -134,11 +165,6 @@ async def _first_visible_list(page, selectors, timeout_each=4000):
     return [], None
 
 async def _first_visible_one_with_selector(page, selectors, timeout_each=4000):
-    """
-    Like _first_visible_one but returns (locator, selector_that_matched).
-    Needed when the caller wants to know which selector won so it can
-    reuse the same one for follow-up interactions.
-    """
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -153,10 +179,7 @@ async def _first_visible_one(page, selectors, timeout_each=4000):
     return loc
 
 
-# ---- NEW: typing helpers that work on a LOCATOR, not a selector string ----
-
 async def _clear_locator(loc):
-    """Focus the located element and clear it. No hardcoded selector."""
     try:
         await loc.click()
         await loc.page.keyboard.press("Control+a")
@@ -166,26 +189,17 @@ async def _clear_locator(loc):
         pass
 
 async def _type_into_locator(loc, text: str, behavior: dict):
-    """
-    Type into an already-found locator with human-ish per-character delays.
-    Avoids the hardcoded `input#search` waiter that was timing out when the
-    page's actual search input had different markup.
-    """
     try:
         await loc.click()
     except Exception:
         pass
     await asyncio.sleep(random.uniform(0.2, 0.5))
-
-    # Per-char typing with jitter — pulled inline so we don't depend on
-    # behavior_engine.human_type's selector-based signature.
     per_char_min = float(behavior.get("type_delay_min", 0.04))
     per_char_max = float(behavior.get("type_delay_max", 0.14))
     for ch in text:
         try:
             await loc.page.keyboard.type(ch)
         except Exception:
-            # Fall back to character event if .type() fails on a weird element
             await loc.page.keyboard.press(ch)
         await asyncio.sleep(random.uniform(per_char_min, per_char_max))
 
@@ -286,17 +300,17 @@ async def handle_youtube_consent(page, behavior):
         "button[aria-label*='Accetta' i]",
         "button[aria-label*='Aceitar' i]",
         "button[aria-label*='Akzeptieren' i]",
-        "button[aria-label*='Hyväksy' i]",        # Finnish
-        "button[aria-label*='Godkänn' i]",        # Swedish
-        "button[aria-label*='Accepter alle' i]",  # Danish
+        "button[aria-label*='Hyväksy' i]",
+        "button[aria-label*='Godkänn' i]",
+        "button[aria-label*='Accepter alle' i]",
         "button:has-text('Accept all')",
         "button:has-text('Alle akzeptieren')",
         "button:has-text('Aceptar todo')",
         "button:has-text('Tout accepter')",
         "button:has-text('Accetta tutto')",
         "button:has-text('Aceitar tudo')",
-        "button:has-text('Hyväksy kaikki')",      # Finnish
-        "button:has-text('Godkänn alla')",        # Swedish
+        "button:has-text('Hyväksy kaikki')",
+        "button:has-text('Godkänn alla')",
         "ytd-button-renderer:has-text('Accept all')",
         ".ytd-consent-bump-v2-renderer button",
     ]
@@ -372,11 +386,9 @@ async def _nav_via_search(page, pid, behavior, channel):
             log.warning(f"    ⚠️ [{pid[:8]}] Homepage nav failed: {str(e)[:60]}")
             return False
 
-    # Find the search box AND remember which selector matched
     box, matched_sel = await _first_visible_one_with_selector(page, SEARCH_BOX_SELECTORS, timeout_each=8000)
     if not box:
         log.warning(f"    ⚠️ [{pid[:8]}] Search box not found after homepage nav.")
-        # Could be a Google challenge that didn't get caught by URL — log url for visibility
         log.warning(f"    🔬 [{pid[:8]}] Current URL: {page.url[:120]}")
         if _is_google_challenge_url(page.url):
             _mark_needs_reverify(pid, page.url)
@@ -384,7 +396,6 @@ async def _nav_via_search(page, pid, behavior, channel):
 
     log.info(f"    ⌨️ [{pid[:8]}] Search box found via selector: {matched_sel}")
 
-    # Use the matched LOCATOR for typing — not a hardcoded selector
     await _clear_locator(box)
     await _type_into_locator(box, term, behavior)
     await asyncio.sleep(random.uniform(0.3, 0.7))
@@ -429,6 +440,41 @@ async def _nav_direct(page, pid, behavior, channel):
             log.warning(f"    ⚠️ [{pid[:8]}] Direct nav failed: {str(e)[:80]}")
             return False
     return await _nav_via_search(page, pid, behavior, channel)
+
+
+async def _get_channel_grid_videos(page, pid):
+    """
+    On a channel /videos page, return the visible video locators and a
+    matching list of their video IDs (extracted from href). Used by
+    sidebar-discovery to know which is the target and which is a decoy.
+    """
+    vids, matching_selector = await _first_visible_list(page, CHANNEL_VIDEO_SELECTORS, timeout_each=20000)
+    if vids:
+        log.info(f"    ✅ [{pid[:8]}] Grid: {len(vids)} videos via {matching_selector}")
+    else:
+        log.info(f"    🔄 [{pid[:8]}] Grid empty — generic watch-link hunt")
+        try:
+            await page.locator("a[href*='/watch?v=']").first.wait_for(state="visible", timeout=10000)
+            all_links = await page.locator("a[href*='/watch?v=']").all()
+            vids = all_links[:20]
+            log.info(f"    ✅ [{pid[:8]}] Fallback found {len(vids)} watch links.")
+        except Exception:
+            vids = []
+
+    ids = []
+    for v in vids:
+        try:
+            href = await v.get_attribute("href")
+            ids.append(_extract_video_id(href or ""))
+        except Exception:
+            ids.append("")
+    return vids, ids
+
+
+async def _get_channel_newest_id(page, pid):
+    """Quick read of the newest video's ID on a channel /videos page."""
+    _, ids = await _get_channel_grid_videos(page, pid)
+    return ids[0] if ids else ""
 
 
 def _pick_video(vids, mode: str, pid: str) -> object:
@@ -491,23 +537,7 @@ async def route_channel_page(page, pid, behavior, channel, video_pick_mode: str 
         else:
             log.info(f"    ℹ️ [{pid[:8]}] Videos tab not found — proceeding with current view.")
 
-    log.info(f"    ⏳ [{pid[:8]}] Waiting for videos (structured selectors)...")
-    vids, matching_selector = await _first_visible_list(page, CHANNEL_VIDEO_SELECTORS, timeout_each=20000)
-
-    if vids:
-        log.info(f"    ✅ [{pid[:8]}] Found {len(vids)} videos via selector: {matching_selector}")
-
-    if not vids:
-        log.info(f"    🔄 [{pid[:8]}] Structured selectors empty — trying generic watch-link hunt")
-        try:
-            await page.locator("a[href*='/watch?v=']").first.wait_for(state="visible", timeout=10000)
-            all_links = await page.locator("a[href*='/watch?v=']").all()
-            vids = all_links[:20]
-            log.info(f"    ✅ [{pid[:8]}] Fallback found {len(vids)} watch links.")
-        except Exception as e:
-            log.info(f"    ⚠️ [{pid[:8]}] Fallback hunt also empty: {str(e)[:60]}")
-            vids = []
-
+    vids, _ = await _get_channel_grid_videos(page, pid)
     if not vids:
         await _diagnostic_snapshot(page, pid, reason="no video grid on channel page")
         if _is_google_challenge_url(page.url):
@@ -528,7 +558,195 @@ async def route_channel_page(page, pid, behavior, channel, video_pick_mode: str 
     return True
 
 
-# ---------- TARGETED-VIDEO routing ----------
+# ---------- SIDEBAR DISCOVERY ROUTE (v6) ----------
+
+async def _find_target_in_sidebar(page, pid, target_id: str):
+    """
+    Scan the watch-page sidebar for a link whose href contains target_id.
+    Returns the matching locator or None if not present.
+    """
+    if not target_id:
+        return None
+
+    for sel in SIDEBAR_VIDEO_SELECTORS:
+        try:
+            await page.locator(sel).first.wait_for(state="visible", timeout=4000)
+            items = await page.locator(sel).all()
+            for item in items[:SIDEBAR_SCAN_LIMIT]:
+                try:
+                    href = await item.get_attribute("href")
+                    if href and target_id in href:
+                        log.info(f"    🎯 [{pid[:8]}] Found target in sidebar.")
+                        return item
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return None
+
+
+async def route_via_sidebar_discovery(page, pid, behavior, channel,
+                                       video_pick_mode: str = "weighted"):
+    """
+    High-signal route: land on channel, briefly watch an OLDER video,
+    then click the target from the recommendation sidebar. This feeds
+    YouTube's "the algorithm surfaces this video well" signal — the
+    strongest input for further recommendation expansion.
+
+    If the target isn't in the sidebar (~40-60% of the time), we fall
+    back to going back to the channel grid and picking the target
+    normally. Result is the same view, just with one extra channel-video
+    watched first, which is itself a useful signal.
+    """
+    log.info(f"    🧲 [{pid[:8]}] Sidebar-discovery route (pick={video_pick_mode})")
+
+    # Step 1: land on channel grid. Use search 50/50 vs direct.
+    prefer_search = random.random() < 0.5
+    if prefer_search:
+        on_channel = await _nav_via_search(page, pid, behavior, channel)
+        if not on_channel:
+            on_channel = await _nav_direct(page, pid, behavior, channel)
+    else:
+        on_channel = await _nav_direct(page, pid, behavior, channel)
+        if not on_channel:
+            on_channel = await _nav_via_search(page, pid, behavior, channel)
+
+    if not on_channel:
+        log.warning(f"    ⚠️ [{pid[:8]}] Could not reach channel for sidebar-discovery.")
+        if _is_google_challenge_url(page.url):
+            _mark_needs_reverify(pid, page.url)
+        return False
+
+    await idle_reading(page, {**behavior, "read_pause_range": (2, 5)})
+
+    if "/videos" not in page.url:
+        videos_tab = await _first_visible_one(page, [
+            "yt-tab-shape:has-text('Videos')",
+            "div.yt-tab-shape-wiz__tab:has-text('Videos')",
+            "tp-yt-paper-tab:has-text('Videos')",
+            "a:has-text('Videos')",
+        ], timeout_each=3000)
+        if videos_tab:
+            await click_humanly(page, videos_tab, behavior)
+            await page.wait_for_timeout(3000)
+
+    # Step 2: read the grid. The newest video's ID is our target_id.
+    vids, ids = await _get_channel_grid_videos(page, pid)
+    if not vids:
+        await _diagnostic_snapshot(page, pid, reason="sidebar-discovery: empty grid")
+        if _is_google_challenge_url(page.url):
+            _mark_needs_reverify(pid, page.url)
+        return False
+
+    target_id = ids[0] if ids else ""
+    if not target_id:
+        log.warning(f"    ⚠️ [{pid[:8]}] Couldn't read target ID from grid — falling back to direct pick.")
+        target = _pick_video(vids, video_pick_mode, pid)
+        if target is None:
+            return False
+        await target.scroll_into_view_if_needed()
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        await click_humanly(page, target, behavior)
+        return True
+
+    log.info(f"    🆔 [{pid[:8]}] Target id from grid: {target_id}")
+
+    # Step 3: pick a DECOY older video (position 3-8). Skip if too few videos.
+    if len(vids) < SIDEBAR_DECOY_POSITION_RANGE[0]:
+        log.info(f"    ℹ️ [{pid[:8]}] Channel has only {len(vids)} videos — too few for decoy; clicking target directly.")
+        target = _pick_video(vids, video_pick_mode, pid)
+        if target is None:
+            return False
+        await target.scroll_into_view_if_needed()
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        await click_humanly(page, target, behavior)
+        return True
+
+    decoy_max = min(SIDEBAR_DECOY_POSITION_RANGE[1], len(vids))
+    decoy_pos = random.randint(SIDEBAR_DECOY_POSITION_RANGE[0], decoy_max) - 1  # 0-indexed
+    decoy = vids[decoy_pos]
+    log.info(f"    🪤 [{pid[:8]}] Decoy: position {decoy_pos+1} on grid.")
+
+    try:
+        await decoy.scroll_into_view_if_needed()
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        await click_humanly(page, decoy, behavior)
+    except Exception as e:
+        log.warning(f"    ⚠️ [{pid[:8]}] Decoy click failed: {str(e)[:60]} — direct pick fallback.")
+        # Re-fetch grid in case the page state changed
+        vids, _ = await _get_channel_grid_videos(page, pid)
+        if not vids:
+            return False
+        target = _pick_video(vids, video_pick_mode, pid)
+        if target is None:
+            return False
+        await target.scroll_into_view_if_needed()
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        await click_humanly(page, target, behavior)
+        return True
+
+    # Step 4: briefly watch the decoy
+    await smart_wait(page, timeout=8000)
+    decoy_watch = random.uniform(*SIDEBAR_DECOY_WATCH_RANGE)
+    log.info(f"    🍿 [{pid[:8]}] Decoy watch: {decoy_watch:.0f}s")
+    elapsed = 0
+    while elapsed < decoy_watch:
+        if _is_shutdown():
+            break
+        chunk = min(10, decoy_watch - elapsed)
+        await asyncio.sleep(chunk)
+        elapsed += chunk
+        # Light ad handling so we don't get stuck on a 30s ad
+        if elapsed % 20 < chunk:
+            await handle_ads(page, behavior, pid)
+
+    if _is_shutdown():
+        return False
+
+    # Step 5: look for the target in the sidebar
+    log.info(f"    🔎 [{pid[:8]}] Scanning sidebar for target {target_id}...")
+    sidebar_target = await _find_target_in_sidebar(page, pid, target_id)
+
+    if sidebar_target:
+        # HIGH-SIGNAL PATH: target was in the sidebar, click it.
+        try:
+            await sidebar_target.scroll_into_view_if_needed()
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            await click_humanly(page, sidebar_target, behavior)
+            await smart_wait(page, timeout=5000)
+            log.info(f"    ✨ [{pid[:8]}] Sidebar-discovery: HIGH-SIGNAL click on target.")
+            return True
+        except Exception as e:
+            log.warning(f"    ⚠️ [{pid[:8]}] Sidebar click failed: {str(e)[:60]}")
+
+    # Step 6: fallback — go back to channel and click the target
+    log.info(f"    ↩️ [{pid[:8]}] Target not in sidebar — back to channel grid for direct pick.")
+    try:
+        await _safe_goto(page, _force_videos_suffix(channel) if channel.startswith("http") else f"https://www.youtube.com/@{_extract_handle(channel)}/videos", pid=pid)
+        await smart_wait(page, timeout=5000)
+    except Exception as e:
+        log.warning(f"    ⚠️ [{pid[:8]}] Back-to-channel nav failed: {str(e)[:60]}")
+        return False
+
+    vids, _ = await _get_channel_grid_videos(page, pid)
+    if not vids:
+        return False
+
+    target = _pick_video(vids, video_pick_mode, pid)
+    if target is None:
+        return False
+    try:
+        await target.scroll_into_view_if_needed()
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        await click_humanly(page, target, behavior)
+    except Exception as e:
+        log.warning(f"    ⚠️ [{pid[:8]}] Fallback target click failed: {str(e)[:60]}")
+        return False
+    return True
+
+
+# ---------- TARGETED-VIDEO routing (search by title) ----------
 
 async def route_specific_video(page, pid, behavior, video_url: str, video_title: str) -> bool:
     target_id = _extract_video_id(video_url)
@@ -647,13 +865,11 @@ async def seed_warmup(page, pid, behavior):
                 return
 
             vids, _ = await _first_visible_list(page, HOMEPAGE_VIDEO_SELECTORS, timeout_each=8000)
-
             if not vids:
                 try:
                     await page.locator("a[href*='/watch?v=']").first.wait_for(state="visible", timeout=8000)
                     all_links = await page.locator("a[href*='/watch?v=']").all()
                     vids = all_links[:15]
-                    log.info(f"    🔄 [{pid[:8]}] Seed fallback found {len(vids)} links.")
                 except Exception:
                     vids = []
 
@@ -686,6 +902,27 @@ async def seed_warmup(page, pid, behavior):
         log.warning(f"    ⚠️ [{pid[:8]}] Seed warmup non-fatal: {str(e)[:80]}")
 
 
+# ---------- route chooser ----------
+
+def _choose_strike_route(video_pick_mode: str):
+    """
+    Decide which route to use for this profile's strike.
+    Sidebar-discovery requires knowing the target (newest/weighted modes).
+    For random channel-browse, we still split 75/25 search/direct.
+    Returns one of: "search", "direct", "sidebar".
+    """
+    if video_pick_mode == "random":
+        # Old behavior — sidebar doesn't apply (no specific target)
+        return "search" if random.random() < 0.75 else "direct"
+
+    r = random.random()
+    if r < SEARCH_ROUTE_PROBABILITY:
+        return "search"
+    if r < SEARCH_ROUTE_PROBABILITY + DIRECT_ROUTE_PROBABILITY:
+        return "direct"
+    return "sidebar"
+
+
 # ---------- core strike ----------
 
 async def execute_target_strike(page, profile, target_keyword, target_channel, warm_day=15,
@@ -709,8 +946,11 @@ async def execute_target_strike(page, profile, target_keyword, target_channel, w
         else:
             keyword = target_keyword
 
-    prefer_search = random.random() < SEARCH_ROUTE_PROBABILITY
-    log.info(f"    🧭 [{pid[:8]}] Route: {'SEARCH' if prefer_search else 'DIRECT'}")
+    if targeted_video_mode:
+        chosen_route = "targeted"
+    else:
+        chosen_route = _choose_strike_route(video_pick_mode)
+    log.info(f"    🧭 [{pid[:8]}] Route: {chosen_route.upper()}")
 
     log.info(f"🎯 [{pid[:8]}] STRIKE: '{keyword}' (Day {warm_day})")
 
@@ -719,20 +959,29 @@ async def execute_target_strike(page, profile, target_keyword, target_channel, w
             log.info(f"    🏃 [{pid[:8]}] Bailout — skipping strike.")
             return
 
-        if not prefer_search and not targeted_video_mode and random.random() < 0.85:
+        # Seed warmup logic — only for direct, non-targeted, non-sidebar
+        # paths (sidebar route already includes a "decoy" watch).
+        if chosen_route == "direct" and not targeted_video_mode and random.random() < 0.85:
             await seed_warmup(page, pid, behavior)
-        elif prefer_search and not targeted_video_mode:
+        elif chosen_route == "search" and not targeted_video_mode:
             log.info(f"    ⏭️ [{pid[:8]}] Skipping seed warmup (SEARCH route navigates home anyway).")
+        elif chosen_route == "sidebar":
+            log.info(f"    ⏭️ [{pid[:8]}] Skipping seed warmup (sidebar route watches a decoy on channel).")
         elif targeted_video_mode:
             log.info(f"    ⏭️ [{pid[:8]}] Skipping seed warmup (targeted-video search navigates home).")
 
         if _is_shutdown():
             return
 
+        # === route to target ===
         if targeted_video_mode:
             found = await route_specific_video(page, pid, behavior,
                                                 target_video_url, target_video_title)
+        elif chosen_route == "sidebar":
+            found = await route_via_sidebar_discovery(page, pid, behavior, target_channel,
+                                                      video_pick_mode=video_pick_mode)
         else:
+            prefer_search = (chosen_route == "search")
             found = await route_channel_page(page, pid, behavior, target_channel,
                                               video_pick_mode=video_pick_mode,
                                               prefer_search=prefer_search)
@@ -825,6 +1074,8 @@ async def execute_target_strike(page, profile, target_keyword, target_channel, w
             elif roll < 0.40:
                 await page.mouse.wheel(0, random.uniform(-100, 100))
 
+        # === social signals ===
+
         if random.random() < LIKE_RATE:
             try:
                 like = page.locator("button[aria-label*='like this video' i]").first
@@ -853,7 +1104,6 @@ async def execute_target_strike(page, profile, target_keyword, target_channel, w
                     await title_el.inner_text()
                     if await title_el.is_visible(timeout=2000) else "Video"
                 )
-
                 desc_el = page.locator("ytd-text-inline-expander#description-inline-expander").first
                 desc_text = (
                     await desc_el.inner_text()
@@ -873,12 +1123,10 @@ async def execute_target_strike(page, profile, target_keyword, target_channel, w
                         profile, video_title_text, desc_text
                     )
                     if comment_text:
-                        # Use the contenteditable comment box via locator-based typing
                         comment_input = page.locator("#contenteditable-root").first
                         if await comment_input.is_visible(timeout=2000):
                             await _type_into_locator(comment_input, comment_text, behavior)
                             await asyncio.sleep(random.uniform(1.0, 2.0))
-
                             submit_btn = page.locator("#submit-button").first
                             if await submit_btn.is_visible(timeout=2000):
                                 await click_humanly(page, submit_btn, behavior)
@@ -890,6 +1138,7 @@ async def execute_target_strike(page, profile, target_keyword, target_channel, w
             except Exception as e:
                 log.debug(f"    Comment failed: {e}")
 
+        # === post-watch handoff (sidebar) ===
         if not _is_shutdown():
             try:
                 side = await page.locator("ytd-compact-video-renderer a#thumbnail").all()

@@ -2,31 +2,13 @@
 main.py
 -------
 Nexus Enterprise Farm Orchestrator.
-Complete production-ready brain for browser warming and targeted strikes.
 
-[PATCHED for Google ASN block]:
-  - Added --no-google flag to skip ALL Google-family tasks
-  - Replaces them with more wander/news/shopping/newsletter
-
-[UPGRADED]:
-- Resilient Task Execution
-- Playwright CDP Retry Matrix
-- Database Bloat Protection (Free-Tier Safe)
-- Viral Velocity Pacing (Beta Distribution S-Curve for Strikes)
-
-[PATCHED] First-navigation proxy-retry:
-  MLX opens the DevTools port slightly BEFORE the proxy credentials are
-  fully wired into the browser. goto_with_proxy_retry() retries the first
-  navigation with backoff so a not-ready proxy no longer kills the task.
-
-[v2 pre-flight — patient first probe]:
-  MLX's proxy auth extension can take 30+ seconds to fully inject into
-  a freshly-launched browser. Previously we declared the proxy dead on
-  the first failure. Now the very first probe URL gets 3 attempts with
-  5s/10s backoff before we move on or give up, because the first request
-  through a not-yet-warm proxy will look exactly like an auth rejection.
-  Subsequent probe URLs still fail-fast since by then the extension
-  should have loaded.
+[v5 — LATEST-VIDEO MODE]:
+  --latest-video        : combined with --strike-channel, every profile
+                          watches the newest video on the channel. Uses
+                          weighted selection (80% pos 1 / 15% pos 2 /
+                          5% pos 3) for a more natural traffic pattern.
+  --latest-video-exact  : same as above but always position 1 (no spread).
 """
 
 import asyncio
@@ -96,9 +78,6 @@ PROXY_ERROR_SIGNATURES = (
     "ERR_HTTPS_PROXY_TUNNEL_RESPONSE_REDIRECT",
 )
 
-# Hard-fail signatures used AFTER the patient first probe. By the time we
-# reach the second probe URL, MLX's auth extension should have loaded —
-# if it still says ERR_INVALID_AUTH_CREDENTIALS, the proxy is genuinely dead.
 PROXY_HARD_FAIL_SIGNATURES = (
     "ERR_INVALID_AUTH_CREDENTIALS",
     "ERR_PROXY_AUTH_REQUESTED",
@@ -112,16 +91,10 @@ def is_proxy_hard_fail(error_msg: str) -> bool:
     return any(sig in error_msg for sig in PROXY_HARD_FAIL_SIGNATURES)
 
 
-# Errors that indicate the proxy simply isn't ready yet (vs. a genuine fault).
 _PROXY_NOT_READY_HINTS = PROXY_ERROR_SIGNATURES + ("ERR_TIMED_OUT", "Timeout")
 
 
 async def goto_with_proxy_retry(page, url: str, pid: str = "", attempts: int = 5):
-    """
-    First-navigation helper: retries past a proxy that MLX hasn't finished
-    wiring up. Only retries on proxy-flavored errors (auth/connection/timeout);
-    a genuine error is re-raised immediately so it isn't masked.
-    """
     last_err = None
     for i in range(attempts):
         try:
@@ -131,8 +104,8 @@ async def goto_with_proxy_retry(page, url: str, pid: str = "", attempts: int = 5
             last_err = e
             msg = str(e)
             if not any(h in msg for h in _PROXY_NOT_READY_HINTS):
-                raise  # a real error, not the warmup race — don't mask it
-            wait = 4 + i * 3   # 4s, 7s, 10s, 13s, 16s
+                raise
+            wait = 4 + i * 3
             if pid:
                 plog(pid, f"⏳ Proxy not ready ({msg[:50]}...) — retry in {wait}s ({i+1}/{attempts})")
             else:
@@ -142,19 +115,6 @@ async def goto_with_proxy_retry(page, url: str, pid: str = "", attempts: int = 5
 
 
 async def preflight_proxy_check(context, pid: str, timeout_ms: int = 8000) -> bool:
-    """
-    A proxy must respond — but the FIRST probe gets retry tolerance because
-    MLX's proxy auth extension is often still loading at this point.
-
-    Strategy:
-      - First probe URL: 3 attempts with 5s/10s backoff. The very first
-        request through a fresh proxy often hits the extension before it
-        has finished registering credentials. We give it room.
-      - Subsequent probe URLs: single attempt, hard-fail on auth errors.
-        By the time we get here, the extension should have loaded; if it
-        STILL rejects auth, the proxy is genuinely dead.
-      - All probes exhausted = dead proxy, skip the profile.
-    """
     probe_urls = [
         "https://api.ipify.org?format=text",
         "https://icanhazip.com",
@@ -165,9 +125,7 @@ async def preflight_proxy_check(context, pid: str, timeout_ms: int = 8000) -> bo
     try:
         test_page = await context.new_page()
 
-        # === First probe: be patient — extension may still be loading ===
         first_url = probe_urls[0]
-        first_passed = False
         for attempt in range(3):
             try:
                 await test_page.goto(first_url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -176,16 +134,12 @@ async def preflight_proxy_check(context, pid: str, timeout_ms: int = 8000) -> bo
             except Exception as e:
                 err = str(e)
                 if attempt < 2:
-                    wait = 5 + attempt * 5  # 5s, then 10s
+                    wait = 5 + attempt * 5
                     plog(pid, f"⏳ First probe failed ({err[:60]}) — extension may still be loading, retry in {wait}s")
                     await asyncio.sleep(wait)
                 else:
                     plog(pid, f"⚠️ First probe exhausted 3 retries: {err[:60]}")
 
-        # === Subsequent probes: single attempt, fail-fast on auth errors ===
-        # If we got here, the first URL failed 3 times. Try alternates once each
-        # in case it was just that one probe URL having issues. But by now the
-        # auth extension should be loaded, so a hard-fail is a real hard-fail.
         for url in probe_urls[1:]:
             try:
                 await test_page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -376,7 +330,9 @@ async def google_session(page, profile: dict):
 
 async def warm_profile(profile: dict, token: str, run_google: bool = True, run_youtube: bool = True,
                        run_wander: bool = True, warm_day: int = 15, strike_keyword: str = None,
-                       strike_channel: str = None, fast_mode: bool = False, no_google: bool = False):
+                       strike_channel: str = None, fast_mode: bool = False, no_google: bool = False,
+                       target_video_url: str = None, target_video_title: str = None,
+                       video_pick_mode: str = "random"):
     pid = profile["id"]
     profile_id = profile.get("profile_id")
     behavior = profile.get("behavior", {})
@@ -450,9 +406,6 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
             "height": vp["height"] + random.randint(-4, 4)
         })
 
-        # ============================================================
-        # PRE-FLIGHT PROXY CHECK — patient first probe, strict thereafter
-        # ============================================================
         proxy_alive = await preflight_proxy_check(context, pid, timeout_ms=8000)
         if not proxy_alive:
             plog(pid, "❌ Proxy did not pass pre-flight — skipping profile")
@@ -469,10 +422,8 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
             await unregister_running_profile(profile_id)
             return
 
-        # ============================================================
-        # BUILD SESSION LIST
-        # ============================================================
         sessions = []
+        targeted_video_mode = bool(target_video_url and target_video_title)
 
         if no_google:
             plog(pid, "🚫 --no-google mode: skipping Google/YouTube/Gmail/Maps/etc")
@@ -489,9 +440,12 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
                 if random.random() < 0.30: sessions.append("wander")
                 plog(pid, f"🔄 Full mode: {len(sessions)} non-Google sessions")
         else:
-            if strike_keyword and strike_channel:
+            if targeted_video_mode:
                 sessions.append("youtube_strike")
-                plog(pid, f"🎯 STRIKE MISSION Queued: {strike_keyword} -> {strike_channel}")
+                plog(pid, f"🎯 TARGETED VIDEO Queued: {target_video_url}")
+            elif strike_keyword and strike_channel:
+                sessions.append("youtube_strike")
+                plog(pid, f"🎯 STRIKE MISSION Queued: {strike_keyword} -> {strike_channel} (pick={video_pick_mode})")
 
             if run_google: sessions.append("google")
             if run_youtube and "youtube_strike" not in sessions: sessions.append("youtube")
@@ -516,9 +470,6 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
             sessions = ["wander"]
             plog(pid, "⚠️ No tasks selected — defaulting to single wander session")
 
-        # ============================================================
-        # EXECUTE SESSIONS
-        # ============================================================
         for session_type in sessions:
             if shutdown_requested:
                 plog(pid, "🛑 Shutdown requested — saving cookies and exiting...")
@@ -527,19 +478,38 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
             plog(pid, f"⚡ Active Task: {session_type.upper()}")
 
             try:
-                if session_type == "google": await google_session(page, profile)
-                elif session_type == "youtube": await youtube_warm_session(page, profile, behavior, warm_day=warm_day)
-                elif session_type == "youtube_strike": await execute_target_strike(page, profile, strike_keyword, strike_channel, warm_day=warm_day)
-                elif session_type == "wander": await wander_session(page, profile)
-                elif session_type == "newsletter": await subscribe_to_newsletter(page, profile)
-                elif session_type == "maps": await maps_warm_session(page, profile)
-                elif session_type == "workspace": await workspace_warm_session(page, profile)
-                elif session_type == "calendar": await calendar_warm_session(page, profile)
-                elif session_type == "news": await news_warm_session(page, profile)
-                elif session_type == "gmail": await gmail_warm_session(page, profile)
-                elif session_type == "shopping": await shopping_warm_session(page, profile)
-                elif session_type == "oauth": await oauth_warm_session(page, profile)
-                elif session_type == "drive": await drive_warm_session(page, profile)
+                if session_type == "google":
+                    await google_session(page, profile)
+                elif session_type == "youtube":
+                    await youtube_warm_session(page, profile, behavior, warm_day=warm_day)
+                elif session_type == "youtube_strike":
+                    await execute_target_strike(
+                        page, profile, strike_keyword, strike_channel,
+                        warm_day=warm_day,
+                        target_video_url=target_video_url,
+                        target_video_title=target_video_title,
+                        video_pick_mode=video_pick_mode,
+                    )
+                elif session_type == "wander":
+                    await wander_session(page, profile)
+                elif session_type == "newsletter":
+                    await subscribe_to_newsletter(page, profile)
+                elif session_type == "maps":
+                    await maps_warm_session(page, profile)
+                elif session_type == "workspace":
+                    await workspace_warm_session(page, profile)
+                elif session_type == "calendar":
+                    await calendar_warm_session(page, profile)
+                elif session_type == "news":
+                    await news_warm_session(page, profile)
+                elif session_type == "gmail":
+                    await gmail_warm_session(page, profile)
+                elif session_type == "shopping":
+                    await shopping_warm_session(page, profile)
+                elif session_type == "oauth":
+                    await oauth_warm_session(page, profile)
+                elif session_type == "drive":
+                    await drive_warm_session(page, profile)
 
                 completed_tasks.append(session_type)
 
@@ -588,7 +558,9 @@ async def warm_profile(profile: dict, token: str, run_google: bool = True, run_y
 async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wander=True,
                   warm_day=15, max_concurrent=15, region=None, strike_keyword=None,
                   strike_channel=None, strike_window=2.0, fast_mode=False,
-                  skip_recent_hours=0, no_google=False):
+                  skip_recent_hours=0, no_google=False,
+                  target_video_url: str = None, target_video_title: str = None,
+                  video_pick_mode: str = "random"):
     log.info("🔑 Authenticating with Multilogin...")
     try:
         token = get_token()
@@ -653,11 +625,13 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
 
     sem = asyncio.Semaphore(max_concurrent)
 
+    targeted_video_mode = bool(target_video_url and target_video_title)
+
     async def process_profile(profile):
         if shutdown_requested:
             return
         base_stagger = random.uniform(1.0, 15.0)
-        if strike_keyword:
+        if strike_keyword or targeted_video_mode:
             window_seconds = strike_window * 3600
             velocity_delay = random.betavariate(2, 4) * window_seconds
             stagger = base_stagger + velocity_delay
@@ -676,7 +650,10 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
             fresh_token = await get_fresh_token()
             await warm_profile(profile, fresh_token, run_google, run_youtube, run_wander,
                                warm_day, strike_keyword, strike_channel,
-                               fast_mode=fast_mode, no_google=no_google)
+                               fast_mode=fast_mode, no_google=no_google,
+                               target_video_url=target_video_url,
+                               target_video_title=target_video_title,
+                               video_pick_mode=video_pick_mode)
             update_last_run(profile["id"])
             await asyncio.sleep(random.uniform(2, 5))
 
@@ -692,7 +669,9 @@ async def run_all(selected_ids=None, run_google=True, run_youtube=True, run_wand
 def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wander=True,
                   warm_day=15, concurrency=15, region=None, strike_keyword=None,
                   strike_channel=None, strike_window=2.0, fast_mode=False,
-                  skip_recent_hours=0, no_google=False):
+                  skip_recent_hours=0, no_google=False,
+                  target_video_url: str = None, target_video_title: str = None,
+                  video_pick_mode: str = "random"):
     run_time = os.getenv("SCHEDULE_TIME", "09:00").strip()
     log.info(f"📅 Scheduler active — Daily target: {run_time} | Region: {region or 'GLOBAL'}")
     current_day = warm_day
@@ -710,7 +689,10 @@ def run_scheduler(selected_ids=None, run_google=True, run_youtube=True, run_wand
                             max_concurrent=concurrency, region=region,
                             strike_keyword=strike_keyword, strike_channel=strike_channel,
                             strike_window=strike_window, fast_mode=fast_mode,
-                            skip_recent_hours=skip_recent_hours, no_google=no_google))
+                            skip_recent_hours=skip_recent_hours, no_google=no_google,
+                            target_video_url=target_video_url,
+                            target_video_title=target_video_title,
+                            video_pick_mode=video_pick_mode))
         current_day += 1
 
 
@@ -732,8 +714,18 @@ if __name__ == "__main__":
     parser.add_argument("--browse-channel", action="store_true")
     parser.add_argument("--skip-recent", type=int, default=0, metavar="HOURS")
     parser.add_argument("--no-google", action="store_true",
-                        help="Skip ALL Google-family tasks. Use when Google has blocked your proxy ASN. "
-                             "Runs only wander/news/shopping/newsletter — safe non-Google warming.")
+                        help="Skip ALL Google-family tasks.")
+    parser.add_argument("--target-video-url", type=str, default=None,
+                        help="Target one specific video by search-by-title. "
+                             "Use with --target-video-title.")
+    parser.add_argument("--target-video-title", type=str, default=None,
+                        help="Exact title of the targeted video (used as search query).")
+    parser.add_argument("--latest-video", action="store_true",
+                        help="With --strike-channel: every profile watches the newest "
+                             "video on the channel. Uses weighted selection "
+                             "(80%% pos 1 / 15%% pos 2 / 5%% pos 3) for organic spread.")
+    parser.add_argument("--latest-video-exact", action="store_true",
+                        help="Like --latest-video but always position 1 (no spread).")
 
     args = parser.parse_args()
 
@@ -742,36 +734,81 @@ if __name__ == "__main__":
     elif args.youtube_only: g, w = False, False
     elif args.wander_only: g, y = False, False
 
-    if args.no_google and (args.strike_keyword or args.strike_channel):
-        log.error("❌ Can't use --no-google with --strike-keyword/--strike-channel (strikes are YouTube).")
+    targeted_video_mode = bool(args.target_video_url and args.target_video_title)
+    latest_video_mode = bool(args.latest_video or args.latest_video_exact)
+
+    # --- Argument validation ---
+    if args.no_google and (args.strike_keyword or args.strike_channel or targeted_video_mode or latest_video_mode):
+        log.error("❌ Can't use --no-google with strike, targeted-video, or latest-video options.")
         exit(1)
 
-    if (args.strike_keyword and not args.strike_channel) or (args.strike_channel and not args.strike_keyword and not args.browse_channel):
-        log.error("❌ Strike Mission Error: You must provide BOTH --strike-keyword and --strike-channel.")
+    if bool(args.target_video_url) != bool(args.target_video_title):
+        log.error("❌ --target-video-url and --target-video-title must be provided together.")
         exit(1)
 
+    if targeted_video_mode and (args.strike_keyword or args.strike_channel or args.browse_channel or latest_video_mode):
+        log.error("❌ --target-video-* is mutually exclusive with --strike-* / --browse-channel / --latest-video.")
+        exit(1)
+
+    if latest_video_mode and not args.strike_channel:
+        log.error("❌ --latest-video / --latest-video-exact requires --strike-channel.")
+        exit(1)
+
+    if args.latest_video and args.latest_video_exact:
+        log.error("❌ Pick one of --latest-video OR --latest-video-exact (not both).")
+        exit(1)
+
+    if not targeted_video_mode and not latest_video_mode:
+        if (args.strike_keyword and not args.strike_channel) or \
+           (args.strike_channel and not args.strike_keyword and not args.browse_channel):
+            log.error("❌ Strike Mission Error: You must provide BOTH --strike-keyword and --strike-channel.")
+            exit(1)
+
+    # Determine strike keyword and video_pick_mode
     strike_kw = args.strike_keyword
-    if args.browse_channel and args.strike_channel and not strike_kw:
+    video_pick_mode = "random"  # default for browse-channel
+
+    if latest_video_mode:
+        # --latest-video implies the browse-channel internal keyword,
+        # but the pick mode is what makes it land on the newest video.
+        if not strike_kw:
+            strike_kw = ["__browse_channel__"]
+        video_pick_mode = "newest" if args.latest_video_exact else "weighted"
+    elif args.browse_channel and args.strike_channel and not strike_kw:
         strike_kw = ["__browse_channel__"]
+        video_pick_mode = "random"
 
     if args.dry_run:
         bots = fetch_active_profiles(args.profile, region=args.region)
         log.info(f"Dry-run: {len(bots)} profiles detected for region '{args.region or 'ALL'}'.")
         if args.no_google:
-            log.info(f"🚫 --no-google mode: would skip Google/YouTube/Gmail/Maps/Calendar/Drive/Workspace/OAuth")
+            log.info(f"🚫 --no-google mode active.")
         if args.fast:
             est = (len(bots) * 9) / args.concurrency
             log.info(f"⚡ Fast mode: ~{est:.0f} min ({est/60:.1f} hours) at -c {args.concurrency}")
-        if strike_kw:
-            log.info(f"Dry-run Strike Active: Targeting {strike_kw} on channel '{args.strike_channel}'")
+        if targeted_video_mode:
+            log.info(f"🎯 Dry-run TARGETED-VIDEO mode: {args.target_video_url}")
+            log.info(f"    Title: '{args.target_video_title}'")
+        elif latest_video_mode:
+            log.info(f"🆕 Dry-run LATEST-VIDEO mode on channel '{args.strike_channel}'")
+            log.info(f"    Pick mode: {video_pick_mode} "
+                     f"({'always position 1' if video_pick_mode == 'newest' else '80/15/5 across positions 1-3'})")
+        elif strike_kw:
+            log.info(f"Dry-run Strike Active: Targeting {strike_kw} on channel '{args.strike_channel}' (pick={video_pick_mode})")
     elif args.schedule:
         run_scheduler(args.profile, g, y, w, args.day, args.concurrency, args.region,
                       strike_kw, args.strike_channel, args.strike_window,
                       fast_mode=args.fast, skip_recent_hours=args.skip_recent,
-                      no_google=args.no_google)
+                      no_google=args.no_google,
+                      target_video_url=args.target_video_url,
+                      target_video_title=args.target_video_title,
+                      video_pick_mode=video_pick_mode)
     else:
         asyncio.run(run_all(args.profile, g, y, w, args.day,
                             max_concurrent=args.concurrency, region=args.region,
                             strike_keyword=strike_kw, strike_channel=args.strike_channel,
                             strike_window=args.strike_window, fast_mode=args.fast,
-                            skip_recent_hours=args.skip_recent, no_google=args.no_google))
+                            skip_recent_hours=args.skip_recent, no_google=args.no_google,
+                            target_video_url=args.target_video_url,
+                            target_video_title=args.target_video_title,
+                            video_pick_mode=video_pick_mode))

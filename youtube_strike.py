@@ -1,28 +1,19 @@
 """
 youtube_strike.py — production version
 
-Latest changes:
-- Force /videos suffix on direct channel URL nav (avoids /featured page
-  where markup is different and Shorts row hijacks the top)
-- Updated CHANNEL_VIDEO_SELECTORS to match YouTube's new "lockup" markup
-  (yt-lockup-view-model) alongside older variants
-- Generic /watch?v= fallback when structured selectors fail
-- Multilingual consent banner selectors
-- Full diagnostic dump (URL/title/body/screenshot) on total failure
-- 20s timeout per structured selector for slow proxies
+[v5 — NEWEST-VIDEO MODE]:
+- video_pick_mode in route_channel_page: "random" | "newest" | "weighted"
+- 80/15/5 weighted-newest selection for organic spread
 
-[v2 fixes — observed live failures]:
-- _nav_via_search now ALWAYS navigates to YouTube root before searching
-  if we're currently on a /watch or /shorts page.
-- Seed warmup is now DIRECT-route-only.
-- Wider search-box selector list with longer per-selector timeout.
-
-[v3 — account health detection]:
-- When the video grid can't be found, we now check whether the page URL
-  contains accounts.google.com or 'uplevelingstep'. If so, the profile
-  has been challenged by Google and needs manual reverification — we
-  log a clear warning and mark the profile in the DB so the next run
-  can skip it until a human fixes it.
+[v5.1 — SEARCH BOX LOCATOR FIX]:
+- _nav_via_search and route_specific_video used a fallback selector list
+  to FIND the search box, but then hardcoded `input#search` for typing.
+  When the page used different markup (e.g. Finnish/Nordic homepage), the
+  find succeeded via fallback but the type-into-`input#search` hit a 60s
+  timeout because that exact selector didn't exist.
+- Fixed by introducing _type_into_locator() and _clear_locator() helpers
+  that work on the actual matched element returned by _first_visible_one.
+  No more hardcoded selectors after the find step.
 """
 
 import asyncio
@@ -38,8 +29,6 @@ from behavior_engine import (
 )
 from llm_helper import generate_contextual_comment
 
-# Used to mark profiles that get hit with a Google account challenge.
-# Wrapped in try/except so the module still imports if the DB layer changes.
 try:
     from profiles_config import update_profile_status as _update_profile_status
 except ImportError:
@@ -48,6 +37,14 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 SEARCH_ROUTE_PROBABILITY = 0.75
+
+LIKE_RATE = 0.08
+SUBSCRIBE_RATE = 0.02
+COMMENT_RATE = 0.015
+
+QUOTED_TITLE_PROBABILITY = 0.5
+
+WEIGHTED_NEWEST_WEIGHTS = [0.80, 0.15, 0.05]
 
 HOMEPAGE_VIDEO_SELECTORS = [
     "ytd-rich-item-renderer ytd-thumbnail a#thumbnail",
@@ -58,15 +55,12 @@ HOMEPAGE_VIDEO_SELECTORS = [
     "ytd-rich-grid-media a#thumbnail",
 ]
 CHANNEL_VIDEO_SELECTORS = [
-    # New lockup markup (YouTube 2024-2025 rollout)
     "ytd-rich-item-renderer ytd-thumbnail a#thumbnail",
     "yt-lockup-view-model a.yt-lockup-metadata-view-model-wiz__title",
     "yt-lockup-view-model a[href*='/watch?v=']",
-    # Older markup (still served to some users in A/B test)
     "ytd-rich-item-renderer a#video-title-link",
     "ytd-grid-video-renderer a#video-title",
     "ytd-rich-grid-media a#video-title-link",
-    # Lowest-common-denominator fallbacks
     "a#video-title-link",
     "a#video-title",
 ]
@@ -76,18 +70,25 @@ CHANNEL_RESULT_SELECTORS = [
     "a.channel-link",
     "ytd-channel-renderer #main-link",
 ]
+# Order matters: try the most specific real-input selectors FIRST so we
+# don't lock onto a wrapper element that can't accept keyboard input.
 SEARCH_BOX_SELECTORS = [
     "input#search",
     "input[name='search_query']",
     "ytd-searchbox input",
     "ytd-masthead input#search",
     "#search-input input",
+    # Last-resort wrappers — only matched if the inputs above didn't exist
+    "ytd-searchbox",
+    "#search-input",
+]
+SEARCH_RESULT_VIDEO_SELECTORS = [
+    "ytd-video-renderer a#video-title",
+    "ytd-video-renderer a#thumbnail",
+    "a#video-title[href*='/watch?v=']",
+    "a[href*='/watch?v=']",
 ]
 
-# URL fragments that indicate Google has challenged this account / device.
-# When any of these appear in page.url after a failed YouTube navigation,
-# we know the proxy is fine and YouTube is fine — the *account itself*
-# has been flagged and a human needs to log in and reverify.
 GOOGLE_CHALLENGE_URL_HINTS = (
     "accounts.google.com",
     "uplevelingstep",
@@ -109,7 +110,6 @@ def _is_shutdown():
     except:
         return False
 
-# Use main.py's proxy-retry helper for EVERY YouTube navigation.
 try:
     from __main__ import goto_with_proxy_retry as _proxy_goto
 except ImportError:
@@ -122,10 +122,6 @@ async def _safe_goto(page, url, pid=""):
 
 
 async def _first_visible_list(page, selectors, timeout_each=4000):
-    """
-    Try each selector in turn. Return the .all() of the first one that
-    matches at least one visible element, along with which selector won.
-    """
     for sel in selectors:
         try:
             loc = page.locator(sel)
@@ -137,15 +133,62 @@ async def _first_visible_list(page, selectors, timeout_each=4000):
             continue
     return [], None
 
-async def _first_visible_one(page, selectors, timeout_each=4000):
+async def _first_visible_one_with_selector(page, selectors, timeout_each=4000):
+    """
+    Like _first_visible_one but returns (locator, selector_that_matched).
+    Needed when the caller wants to know which selector won so it can
+    reuse the same one for follow-up interactions.
+    """
     for sel in selectors:
         try:
             loc = page.locator(sel).first
             if await loc.is_visible(timeout=timeout_each):
-                return loc
+                return loc, sel
         except Exception:
             continue
-    return None
+    return None, None
+
+async def _first_visible_one(page, selectors, timeout_each=4000):
+    loc, _ = await _first_visible_one_with_selector(page, selectors, timeout_each)
+    return loc
+
+
+# ---- NEW: typing helpers that work on a LOCATOR, not a selector string ----
+
+async def _clear_locator(loc):
+    """Focus the located element and clear it. No hardcoded selector."""
+    try:
+        await loc.click()
+        await loc.page.keyboard.press("Control+a")
+        await loc.page.keyboard.press("Backspace")
+        await asyncio.sleep(random.uniform(0.3, 0.6))
+    except Exception:
+        pass
+
+async def _type_into_locator(loc, text: str, behavior: dict):
+    """
+    Type into an already-found locator with human-ish per-character delays.
+    Avoids the hardcoded `input#search` waiter that was timing out when the
+    page's actual search input had different markup.
+    """
+    try:
+        await loc.click()
+    except Exception:
+        pass
+    await asyncio.sleep(random.uniform(0.2, 0.5))
+
+    # Per-char typing with jitter — pulled inline so we don't depend on
+    # behavior_engine.human_type's selector-based signature.
+    per_char_min = float(behavior.get("type_delay_min", 0.04))
+    per_char_max = float(behavior.get("type_delay_max", 0.14))
+    for ch in text:
+        try:
+            await loc.page.keyboard.type(ch)
+        except Exception:
+            # Fall back to character event if .type() fails on a weird element
+            await loc.page.keyboard.press(ch)
+        await asyncio.sleep(random.uniform(per_char_min, per_char_max))
+
 
 def _extract_handle(channel: str) -> str:
     c = channel.strip()
@@ -158,17 +201,20 @@ def _extract_handle(channel: str) -> str:
     return c
 
 
+_YT_VIDEO_ID_RE = re.compile(r"(?:v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})")
+
+def _extract_video_id(url: str) -> str:
+    if not url:
+        return ""
+    m = _YT_VIDEO_ID_RE.search(url)
+    return m.group(1) if m else ""
+
+
 def _is_google_challenge_url(url: str) -> bool:
-    """True if the URL indicates Google has redirected to an account challenge."""
     return any(hint in url for hint in GOOGLE_CHALLENGE_URL_HINTS)
 
 
 def _mark_needs_reverify(pid: str, evidence_url: str):
-    """
-    Mark a profile as NEEDS_REVERIFY in the database so future runs can
-    skip it until a human manually fixes the Google account challenge.
-    Safe to call even if the DB module isn't importable — we just log.
-    """
     log.warning(
         f"    🚨 [{pid[:8]}] Account challenged by Google — needs manual reverify. "
         f"Land on: {evidence_url[:120]}"
@@ -186,10 +232,6 @@ def _mark_needs_reverify(pid: str, evidence_url: str):
 
 
 async def _diagnostic_snapshot(page, pid: str, reason: str):
-    """
-    Capture diagnostic info when video discovery fails: URL, title,
-    counts of likely-relevant elements, and a full-page screenshot.
-    """
     try:
         os.makedirs("debug_shots", exist_ok=True)
         current_url = page.url
@@ -224,10 +266,6 @@ async def _diagnostic_snapshot(page, pid: str, reason: str):
 
 
 def _is_on_search_capable_page(url: str) -> bool:
-    """
-    Returns False if the current URL is a /watch or /shorts page (where
-    the standard masthead search box may not be reliably interactable).
-    """
     if "youtube.com" not in url:
         return False
     if "/watch" in url:
@@ -243,17 +281,22 @@ async def handle_youtube_consent(page, behavior):
     await page.wait_for_timeout(3000)
     selectors = [
         "button[aria-label*='Accept' i]",
-        "button[aria-label*='Aceptar' i]",       # Spanish
-        "button[aria-label*='Accepter' i]",      # French
-        "button[aria-label*='Accetta' i]",       # Italian
-        "button[aria-label*='Aceitar' i]",       # Portuguese
-        "button[aria-label*='Akzeptieren' i]",   # German
+        "button[aria-label*='Aceptar' i]",
+        "button[aria-label*='Accepter' i]",
+        "button[aria-label*='Accetta' i]",
+        "button[aria-label*='Aceitar' i]",
+        "button[aria-label*='Akzeptieren' i]",
+        "button[aria-label*='Hyväksy' i]",        # Finnish
+        "button[aria-label*='Godkänn' i]",        # Swedish
+        "button[aria-label*='Accepter alle' i]",  # Danish
         "button:has-text('Accept all')",
         "button:has-text('Alle akzeptieren')",
         "button:has-text('Aceptar todo')",
         "button:has-text('Tout accepter')",
         "button:has-text('Accetta tutto')",
         "button:has-text('Aceitar tudo')",
+        "button:has-text('Hyväksy kaikki')",      # Finnish
+        "button:has-text('Godkänn alla')",        # Swedish
         "ytd-button-renderer:has-text('Accept all')",
         ".ytd-consent-bump-v2-renderer button",
     ]
@@ -281,17 +324,6 @@ async def handle_ads(page, behavior, pid):
     except Exception:
         pass
 
-async def clear_search_box(page, selector):
-    try:
-        el = page.locator(selector).first
-        if await el.is_visible(timeout=2000):
-            await el.click()
-            await page.keyboard.press("Control+a")
-            await page.keyboard.press("Backspace")
-            await asyncio.sleep(random.uniform(0.3, 0.6))
-    except:
-        pass
-
 async def force_360p(page, profile_id, behavior):
     try:
         player = page.locator("#movie_player").first
@@ -317,10 +349,6 @@ async def force_360p(page, profile_id, behavior):
 
 
 def _force_videos_suffix(channel_url: str) -> str:
-    """
-    Ensure a channel URL ends with /videos so YouTube doesn't drop us on
-    /featured (different markup, Shorts row at top hides the grid).
-    """
     url = channel_url.rstrip("/")
     for suffix in ("/videos", "/featured", "/shorts", "/streams", "/community", "/playlists"):
         if url.endswith(suffix):
@@ -331,17 +359,9 @@ def _force_videos_suffix(channel_url: str) -> str:
 # ---------- channel routing ----------
 
 async def _nav_via_search(page, pid, behavior, channel):
-    """
-    Search route: type the channel handle into YouTube's search bar,
-    find the channel card in results, click it. Then ensure we land
-    on /videos (some channel cards drop you on /featured).
-    """
     term = _extract_handle(channel)
     log.info(f"    🔍 [{pid[:8]}] Search route: looking up '{term}'...")
 
-    # CRITICAL: always make sure we're on a page with the standard search box.
-    # /watch and /shorts pages have different markup that breaks the search
-    # selectors. If we just came from seed_warmup, we're definitely on /watch.
     if not _is_on_search_capable_page(page.url):
         log.info(f"    🏠 [{pid[:8]}] Navigating to YouTube homepage for clean search bar...")
         try:
@@ -352,14 +372,22 @@ async def _nav_via_search(page, pid, behavior, channel):
             log.warning(f"    ⚠️ [{pid[:8]}] Homepage nav failed: {str(e)[:60]}")
             return False
 
-    box = await _first_visible_one(page, SEARCH_BOX_SELECTORS, timeout_each=8000)
+    # Find the search box AND remember which selector matched
+    box, matched_sel = await _first_visible_one_with_selector(page, SEARCH_BOX_SELECTORS, timeout_each=8000)
     if not box:
         log.warning(f"    ⚠️ [{pid[:8]}] Search box not found after homepage nav.")
+        # Could be a Google challenge that didn't get caught by URL — log url for visibility
+        log.warning(f"    🔬 [{pid[:8]}] Current URL: {page.url[:120]}")
+        if _is_google_challenge_url(page.url):
+            _mark_needs_reverify(pid, page.url)
         return False
 
-    await click_humanly(page, box, behavior)
-    await clear_search_box(page, "input#search")
-    await human_type(page, "input#search", term, behavior)
+    log.info(f"    ⌨️ [{pid[:8]}] Search box found via selector: {matched_sel}")
+
+    # Use the matched LOCATOR for typing — not a hardcoded selector
+    await _clear_locator(box)
+    await _type_into_locator(box, term, behavior)
+    await asyncio.sleep(random.uniform(0.3, 0.7))
     await page.keyboard.press("Enter")
     await smart_wait(page, timeout=8000)
 
@@ -373,7 +401,6 @@ async def _nav_via_search(page, pid, behavior, channel):
     await click_humanly(page, link, behavior)
     await smart_wait(page, timeout=5000)
 
-    # We probably landed on /featured — navigate to /videos for the proper grid.
     if channel.startswith("http"):
         videos_url = _force_videos_suffix(channel)
         if videos_url != channel.rstrip("/"):
@@ -390,10 +417,6 @@ async def _nav_via_search(page, pid, behavior, channel):
 
 
 async def _nav_direct(page, pid, behavior, channel):
-    """
-    Direct route: navigate straight to the channel's /videos URL so the
-    grid is the primary content (not behind a Shorts row on /featured).
-    """
     if channel.startswith("http"):
         target_url = _force_videos_suffix(channel)
         log.info(f"    🌐 [{pid[:8]}] Direct route: {target_url}")
@@ -408,8 +431,31 @@ async def _nav_direct(page, pid, behavior, channel):
     return await _nav_via_search(page, pid, behavior, channel)
 
 
-async def route_channel_page(page, pid, behavior, channel, pick_random_video=True, prefer_search=True):
-    log.info(f"    🛣️ [{pid[:8]}] Channel route ({'search-first' if prefer_search else 'direct-first'})")
+def _pick_video(vids, mode: str, pid: str) -> object:
+    if not vids:
+        return None
+
+    if mode == "newest" or len(vids) == 1:
+        log.info(f"    📌 [{pid[:8]}] Pick: newest (position 1).")
+        return vids[0]
+
+    if mode == "weighted":
+        pool = vids[:min(3, len(vids))]
+        weights = WEIGHTED_NEWEST_WEIGHTS[:len(pool)]
+        chosen = random.choices(pool, weights=weights, k=1)[0]
+        idx = pool.index(chosen) + 1
+        log.info(f"    🎯 [{pid[:8]}] Pick: weighted-newest (position {idx} of {len(pool)}).")
+        return chosen
+
+    pool = vids[:min(8, len(vids))]
+    chosen = random.choice(pool)
+    log.info(f"    🎲 [{pid[:8]}] Pick: random video (1 of {len(pool)}).")
+    return chosen
+
+
+async def route_channel_page(page, pid, behavior, channel, video_pick_mode: str = "random",
+                              prefer_search: bool = True):
+    log.info(f"    🛣️ [{pid[:8]}] Channel route ({'search-first' if prefer_search else 'direct-first'}, pick={video_pick_mode})")
 
     on_channel = False
     if prefer_search:
@@ -425,15 +471,12 @@ async def route_channel_page(page, pid, behavior, channel, pick_random_video=Tru
 
     if not on_channel:
         log.warning(f"    ⚠️ [{pid[:8]}] Could not reach channel.")
-        # Even before checking selectors, if we got redirected to a Google
-        # challenge URL, mark the profile now so we don't waste more time.
         if _is_google_challenge_url(page.url):
             _mark_needs_reverify(pid, page.url)
         return False
 
     await idle_reading(page, {**behavior, "read_pause_range": (2, 5)})
 
-    # If we somehow ended up off /videos, try clicking the Videos tab
     if "/videos" not in page.url:
         videos_tab = await _first_visible_one(page, [
             "yt-tab-shape:has-text('Videos')",
@@ -448,14 +491,12 @@ async def route_channel_page(page, pid, behavior, channel, pick_random_video=Tru
         else:
             log.info(f"    ℹ️ [{pid[:8]}] Videos tab not found — proceeding with current view.")
 
-    # ----- VIDEO GRID DISCOVERY -----
     log.info(f"    ⏳ [{pid[:8]}] Waiting for videos (structured selectors)...")
     vids, matching_selector = await _first_visible_list(page, CHANNEL_VIDEO_SELECTORS, timeout_each=20000)
 
     if vids:
         log.info(f"    ✅ [{pid[:8]}] Found {len(vids)} videos via selector: {matching_selector}")
 
-    # Fallback: hunt for any /watch?v= link
     if not vids:
         log.info(f"    🔄 [{pid[:8]}] Structured selectors empty — trying generic watch-link hunt")
         try:
@@ -467,21 +508,15 @@ async def route_channel_page(page, pid, behavior, channel, pick_random_video=Tru
             log.info(f"    ⚠️ [{pid[:8]}] Fallback hunt also empty: {str(e)[:60]}")
             vids = []
 
-    # Total failure — dump diagnostics AND check for account challenge
     if not vids:
         await _diagnostic_snapshot(page, pid, reason="no video grid on channel page")
-        # If the failure was because Google challenged the account, mark it
-        # in the DB so future runs can skip until a human manually reverifies.
         if _is_google_challenge_url(page.url):
             _mark_needs_reverify(pid, page.url)
         return False
 
-    if pick_random_video and len(vids) > 1:
-        pool = vids[:min(8, len(vids))]
-        target = random.choice(pool)
-        log.info(f"    🎲 [{pid[:8]}] Picked random video (1 of {len(pool)}).")
-    else:
-        target = vids[0]
+    target = _pick_video(vids, video_pick_mode, pid)
+    if target is None:
+        return False
 
     try:
         await target.scroll_into_view_if_needed()
@@ -493,15 +528,106 @@ async def route_channel_page(page, pid, behavior, channel, pick_random_video=Tru
     return True
 
 
+# ---------- TARGETED-VIDEO routing ----------
+
+async def route_specific_video(page, pid, behavior, video_url: str, video_title: str) -> bool:
+    target_id = _extract_video_id(video_url)
+    if not target_id:
+        log.warning(f"    ⚠️ [{pid[:8]}] Could not parse video ID from URL: {video_url}")
+        return False
+
+    log.info(f"    🎯 [{pid[:8]}] Targeted video: id={target_id}, title='{video_title[:60]}...'")
+
+    use_quotes = random.random() < QUOTED_TITLE_PROBABILITY
+    query = f'"{video_title}"' if use_quotes else video_title
+    log.info(f"    ⌨️ [{pid[:8]}] Search query: {'QUOTED' if use_quotes else 'PLAIN'}")
+
+    if not _is_on_search_capable_page(page.url):
+        log.info(f"    🏠 [{pid[:8]}] Navigating to YouTube homepage for clean search bar...")
+        try:
+            await _safe_goto(page, "https://www.youtube.com", pid=pid)
+            await handle_youtube_consent(page, behavior)
+            await smart_wait(page, timeout=5000)
+        except Exception as e:
+            log.warning(f"    ⚠️ [{pid[:8]}] Homepage nav failed: {str(e)[:60]}")
+            return await _fallback_direct_watch(page, pid, behavior, video_url)
+
+    box, matched_sel = await _first_visible_one_with_selector(page, SEARCH_BOX_SELECTORS, timeout_each=8000)
+    if not box:
+        log.warning(f"    ⚠️ [{pid[:8]}] Search box not found.")
+        if _is_google_challenge_url(page.url):
+            _mark_needs_reverify(pid, page.url)
+        return await _fallback_direct_watch(page, pid, behavior, video_url)
+
+    log.info(f"    ⌨️ [{pid[:8]}] Search box found via selector: {matched_sel}")
+
+    try:
+        await _clear_locator(box)
+        await _type_into_locator(box, query, behavior)
+        await asyncio.sleep(random.uniform(0.3, 0.7))
+        await page.keyboard.press("Enter")
+        await smart_wait(page, timeout=8000)
+    except Exception as e:
+        log.warning(f"    ⚠️ [{pid[:8]}] Search typing failed: {str(e)[:60]}")
+        return await _fallback_direct_watch(page, pid, behavior, video_url)
+
+    log.info(f"    🔎 [{pid[:8]}] Scanning results for target ID {target_id}...")
+    matching_link = None
+
+    for sel in SEARCH_RESULT_VIDEO_SELECTORS:
+        try:
+            await page.locator(sel).first.wait_for(state="visible", timeout=6000)
+            links = await page.locator(sel).all()
+            if not links:
+                continue
+            for link in links[:15]:
+                try:
+                    href = await link.get_attribute("href")
+                    if not href:
+                        continue
+                    if target_id in href:
+                        matching_link = link
+                        log.info(f"    🎯 [{pid[:8]}] Found target in search results.")
+                        break
+                except Exception:
+                    continue
+            if matching_link:
+                break
+        except Exception:
+            continue
+
+    if matching_link:
+        try:
+            await matching_link.scroll_into_view_if_needed()
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            await click_humanly(page, matching_link, behavior)
+            await smart_wait(page, timeout=5000)
+            return True
+        except Exception as e:
+            log.warning(f"    ⚠️ [{pid[:8]}] Click on matched result failed: {str(e)[:60]}")
+
+    log.info(f"    ↪️ [{pid[:8]}] Target not found in search results — falling back to direct watch URL.")
+    return await _fallback_direct_watch(page, pid, behavior, video_url)
+
+
+async def _fallback_direct_watch(page, pid, behavior, video_url: str) -> bool:
+    log.info(f"    🌐 [{pid[:8]}] Direct watch nav: {video_url}")
+    try:
+        await _safe_goto(page, video_url, pid=pid)
+        await handle_youtube_consent(page, behavior)
+        await smart_wait(page, timeout=5000)
+        if _is_google_challenge_url(page.url):
+            _mark_needs_reverify(pid, page.url)
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"    ⚠️ [{pid[:8]}] Direct watch nav failed: {str(e)[:80]}")
+        return False
+
+
 # ---------- seed warmup ----------
 
 async def seed_warmup(page, pid, behavior):
-    """
-    Watches 1-2 random homepage videos before navigating to the target.
-    Best for DIRECT route — gives the bot some session history before
-    hitting the channel URL directly. Skip for SEARCH route since the
-    bot will navigate to the homepage anyway as part of searching.
-    """
     try:
         num = random.choice([1, 2])
         log.info(f"    🌱 [{pid[:8]}] Seed warmup: {num} video(s)...")
@@ -516,9 +642,6 @@ async def seed_warmup(page, pid, behavior):
             await handle_youtube_consent(page, behavior)
             await smart_wait(page, timeout=5000)
 
-            # If seed warmup landed on a Google challenge, abort immediately
-            # and mark the profile — no point watching seed videos when we
-            # can already see the account is flagged.
             if _is_google_challenge_url(page.url):
                 _mark_needs_reverify(pid, page.url)
                 return
@@ -565,50 +688,54 @@ async def seed_warmup(page, pid, behavior):
 
 # ---------- core strike ----------
 
-async def execute_target_strike(page, profile, target_keyword, target_channel, warm_day=15):
+async def execute_target_strike(page, profile, target_keyword, target_channel, warm_day=15,
+                                target_video_url: str = None, target_video_title: str = None,
+                                video_pick_mode: str = "random"):
     pid = profile["id"]
     behavior = profile.get("behavior", {})
 
-    browse_mode = False
-    if isinstance(target_keyword, list):
-        if "__browse_channel__" in target_keyword:
-            browse_mode = True
-            keyword = target_channel
-            log.info(f"    🔎 [{pid[:8]}] Browse-channel mode")
-        else:
-            keyword = random.choice(target_keyword)
+    targeted_video_mode = bool(target_video_url and target_video_title)
+
+    if targeted_video_mode:
+        log.info(f"    🎯 [{pid[:8]}] Targeted-video mode")
+        keyword = target_video_title
     else:
-        keyword = target_keyword
+        if isinstance(target_keyword, list):
+            if "__browse_channel__" in target_keyword:
+                keyword = target_channel
+                log.info(f"    🔎 [{pid[:8]}] Channel mode (pick={video_pick_mode})")
+            else:
+                keyword = random.choice(target_keyword)
+        else:
+            keyword = target_keyword
 
     prefer_search = random.random() < SEARCH_ROUTE_PROBABILITY
     log.info(f"    🧭 [{pid[:8]}] Route: {'SEARCH' if prefer_search else 'DIRECT'}")
 
-    can_like = warm_day >= 10
-    can_sub_comment = warm_day >= 25
-
-    log.info(f"🎯 [{pid[:8]}] STRIKE: '{keyword}' -> {target_channel} (Day {warm_day})")
+    log.info(f"🎯 [{pid[:8]}] STRIKE: '{keyword}' (Day {warm_day})")
 
     try:
         if random.random() < 0.05:
             log.info(f"    🏃 [{pid[:8]}] Bailout — skipping strike.")
             return
 
-        # Seed warmup is most useful for DIRECT route (builds session history
-        # before hitting the target channel URL). For SEARCH route, the bot
-        # navigates to the homepage anyway as part of searching, so the seed
-        # warmup is redundant AND leaves the page on a /watch URL we have
-        # to navigate away from. Skip it for search.
-        if not prefer_search and random.random() < 0.85:
+        if not prefer_search and not targeted_video_mode and random.random() < 0.85:
             await seed_warmup(page, pid, behavior)
-        elif prefer_search:
+        elif prefer_search and not targeted_video_mode:
             log.info(f"    ⏭️ [{pid[:8]}] Skipping seed warmup (SEARCH route navigates home anyway).")
+        elif targeted_video_mode:
+            log.info(f"    ⏭️ [{pid[:8]}] Skipping seed warmup (targeted-video search navigates home).")
 
         if _is_shutdown():
             return
 
-        # === navigate to a video on the target channel ===
-        found = await route_channel_page(page, pid, behavior, target_channel,
-                                          pick_random_video=True, prefer_search=prefer_search)
+        if targeted_video_mode:
+            found = await route_specific_video(page, pid, behavior,
+                                                target_video_url, target_video_title)
+        else:
+            found = await route_channel_page(page, pid, behavior, target_channel,
+                                              video_pick_mode=video_pick_mode,
+                                              prefer_search=prefer_search)
         if not found:
             log.warning(f"    ❌ [{pid[:8]}] Could not reach target video. Aborting strike.")
             return
@@ -618,7 +745,6 @@ async def execute_target_strike(page, profile, target_keyword, target_channel, w
         await page.mouse.click(5, 5)
         await page.evaluate("window.focus()")
 
-        # === read duration FIRST, then compute plan ===
         duration_str = "5:00"
         try:
             dur = page.locator(".ytp-time-duration").first
@@ -655,7 +781,6 @@ async def execute_target_strike(page, profile, target_keyword, target_channel, w
 
         log.info(f"    ⏱️ [{pid[:8]}] Plan: {watch_pct*100:.1f}% ({target_watch_time}s of {total_seconds}s)")
 
-        # === deep watch loop ===
         time_watched = 0
         rewind_spiked = False
         ad_check_interval = 45
@@ -700,8 +825,7 @@ async def execute_target_strike(page, profile, target_keyword, target_channel, w
             elif roll < 0.40:
                 await page.mouse.wheel(0, random.uniform(-100, 100))
 
-        # === social signals (gated) ===
-        if can_like and random.random() < 0.15:
+        if random.random() < LIKE_RATE:
             try:
                 like = page.locator("button[aria-label*='like this video' i]").first
                 if await like.is_visible(timeout=2000):
@@ -711,7 +835,7 @@ async def execute_target_strike(page, profile, target_keyword, target_channel, w
             except Exception:
                 pass
 
-        if can_sub_comment and random.random() < 0.05:
+        if random.random() < SUBSCRIBE_RATE:
             try:
                 sub = page.locator("#subscribe-button-shape button").first
                 if await sub.is_visible(timeout=2000) and "Subscribed" not in await sub.inner_text():
@@ -721,7 +845,51 @@ async def execute_target_strike(page, profile, target_keyword, target_channel, w
             except Exception:
                 pass
 
-        # === post-watch handoff ===
+        if random.random() < COMMENT_RATE:
+            try:
+                log.info(f"    🧠 [{pid[:8]}] Generating contextual comment...")
+                title_el = page.locator("h1.ytd-watch-metadata").first
+                video_title_text = (
+                    await title_el.inner_text()
+                    if await title_el.is_visible(timeout=2000) else "Video"
+                )
+
+                desc_el = page.locator("ytd-text-inline-expander#description-inline-expander").first
+                desc_text = (
+                    await desc_el.inner_text()
+                    if await desc_el.is_visible(timeout=2000) else ""
+                )
+                desc_text = desc_text[:500]
+
+                await page.evaluate("window.scrollBy(0, 600)")
+                await asyncio.sleep(random.uniform(2.0, 4.0))
+
+                comment_box = page.locator("#simplebox-placeholder").first
+                if await comment_box.is_visible(timeout=3000):
+                    await click_humanly(page, comment_box, behavior)
+                    await asyncio.sleep(random.uniform(1.0, 2.0))
+
+                    comment_text = await generate_contextual_comment(
+                        profile, video_title_text, desc_text
+                    )
+                    if comment_text:
+                        # Use the contenteditable comment box via locator-based typing
+                        comment_input = page.locator("#contenteditable-root").first
+                        if await comment_input.is_visible(timeout=2000):
+                            await _type_into_locator(comment_input, comment_text, behavior)
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
+
+                            submit_btn = page.locator("#submit-button").first
+                            if await submit_btn.is_visible(timeout=2000):
+                                await click_humanly(page, submit_btn, behavior)
+                                log.info(f"    💬 [{pid[:8]}] Left comment: '{comment_text[:60]}'")
+                    else:
+                        log.info(f"    ⚠️ [{pid[:8]}] LLM returned empty comment, skipping.")
+
+                await page.evaluate("window.scrollTo(0, 0)")
+            except Exception as e:
+                log.debug(f"    Comment failed: {e}")
+
         if not _is_shutdown():
             try:
                 side = await page.locator("ytd-compact-video-renderer a#thumbnail").all()
